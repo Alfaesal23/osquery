@@ -25,8 +25,11 @@
 #include <osquery/hashing/hashing.h>
 #include <osquery/logger/logger.h>
 #include <osquery/remote/uri.h>
+#include <osquery/remote/utility.h>
 #include <osquery/tables/yara/yara_utils.h>
 #include <osquery/utils/status/status.h>
+#include <osquery/worker/ipc/platform_table_container_ipc.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 #include <osquery/worker/system/memory.h>
 
 #ifdef CONCAT
@@ -49,6 +52,12 @@ FLAG(uint32,
      50,
      "Time in ms to sleep after scan of each file (default 50) to reduce "
      "memory spikes");
+
+FLAG(bool,
+     yara_sigurl_authenticate,
+     false,
+     "Enable authentication in yara sigrule requests. Request will be "
+     "authenticated with the node key like other osquery TLS requests.");
 
 HIDDEN_FLAG(bool,
             enable_yara_string,
@@ -135,7 +144,21 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
     http::Response response;
     http::Request request(url);
 
-    response = client.get(request);
+    if (FLAGS_yara_sigurl_authenticate) {
+      // If authentication is turned on, make a POST request with the node key
+      // in the JSON body.
+      JSON params;
+      params.add("node_key", getNodeKey("tls"));
+      std::string postBody;
+      Status result = params.toString(postBody);
+      if (!result.ok()) {
+        return Status::failure("Failed to stringify JSON body: " +
+                               result.getMessage());
+      }
+      response = client.post(request, postBody, "application/json");
+    } else {
+      response = client.get(request);
+    }
     // Check for the status code and update the rule string on success
     // and result has been transmitted to the message body
     if (response.status() == 200) {
@@ -166,6 +189,8 @@ void doYARAScan(YR_RULES* rules,
   row["sig_group"] = SQL_TEXT("");
   row["sigfile"] = SQL_TEXT("");
   row["sigrule"] = SQL_TEXT("");
+  // This is a default value to be set by namespace handler as appropriate
+  row["pid_with_namespace"] = "0";
 
   // This could use target_path instead to be consistent with yara_events.
   row["path"] = path;
@@ -278,14 +303,14 @@ Status getYaraRules(YARAConfigParser parser,
   return Status::success();
 }
 
-QueryData genYara(QueryContext& context) {
+QueryData genYaraImpl(QueryContext& context, Logger& logger) {
   QueryData results;
   YaraScanContext scanContext;
 
   // Initialize yara library
   auto init_status = yaraInitialize();
   if (!init_status.ok()) {
-    LOG(WARNING) << init_status.toString();
+    logger.log(google::GLOG_WARNING, init_status.toString());
     return results;
   }
 
@@ -310,7 +335,7 @@ QueryData genYara(QueryContext& context) {
     auto sigfiles = context.constraints["sigfile"].getAll(EQUALS);
     auto status = getYaraRules(yaraParser, sigfiles, YC_FILE, scanContext);
     if (!status.ok()) {
-      LOG(WARNING) << status.toString();
+      logger.log(google::GLOG_WARNING, status.toString());
       return results;
     }
   }
@@ -321,7 +346,7 @@ QueryData genYara(QueryContext& context) {
     auto sigrules = context.constraints["sigrule"].getAll(EQUALS);
     auto status = getYaraRules(yaraParser, sigrules, YC_RULE, scanContext);
     if (!status.ok()) {
-      LOG(WARNING) << status.toString();
+      logger.log(google::GLOG_WARNING, status.toString());
       return results;
     }
   }
@@ -330,7 +355,7 @@ QueryData genYara(QueryContext& context) {
     auto sigurls = context.constraints["sigurl"].getAll(EQUALS);
     auto status = getYaraRules(yaraParser, sigurls, YC_URL, scanContext);
     if (!status.ok()) {
-      LOG(WARNING) << status.toString();
+      logger.log(google::GLOG_WARNING, status.toString());
       return results;
     }
   }
@@ -407,7 +432,7 @@ QueryData genYara(QueryContext& context) {
   // more than once it will decrease the reference counter and return
   auto fini_status = yaraFinalize();
   if (!fini_status.ok()) {
-    LOG(WARNING) << fini_status.toString();
+    logger.log(google::GLOG_WARNING, fini_status.toString());
   }
 
 #ifdef OSQUERY_LINUX
@@ -417,5 +442,15 @@ QueryData genYara(QueryContext& context) {
 
   return results;
 }
+
+QueryData genYara(QueryContext& context) {
+  if (hasNamespaceConstraint(context)) {
+    return generateInNamespace(context, "yara", genYaraImpl);
+  } else {
+    GLOGLogger logger;
+    return genYaraImpl(context, logger);
+  }
+}
+
 } // namespace tables
 } // namespace osquery

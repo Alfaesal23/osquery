@@ -1,5 +1,5 @@
 table_name("certificates")
-description("Certificate Authorities installed in Keychains/ca-bundles.")
+description("Certificate Authorities installed in Keychains/ca-bundles. NOTE: osquery limits frequent access to keychain files on macOS. This limit is controlled by keychain_access_interval flag.")
 schema([
     Column("common_name", TEXT, "Certificate CommonName"),
     Column("subject", TEXT, "Certificate distinguished name (deprecated, use subject2)"),
@@ -15,7 +15,7 @@ schema([
     Column("subject_key_id", TEXT, "SKID an optionally included SHA1"),
     Column("authority_key_id", TEXT, "AKID an optionally included SHA1"),
     Column("sha1", TEXT, "SHA1 hash of the raw certificate contents"),
-    Column("path", TEXT, "Path to Keychain or PEM bundle", additional=True),
+    Column("path", TEXT, "Path to Keychain or PEM bundle", additional=True, optimized=True),
     Column("serial", TEXT, "Certificate serial number"),
 
 ])

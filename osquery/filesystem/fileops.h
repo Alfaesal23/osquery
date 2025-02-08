@@ -242,6 +242,10 @@ class PlatformFile : private boost::noncopyable {
     return handle_;
   }
 
+  const boost::filesystem::path& getFilePath() const {
+    return fname_;
+  }
+
   /**
    * @brief Returns success if owner of the file is root.
    *
@@ -268,9 +272,6 @@ class PlatformFile : private boost::noncopyable {
 
   /// Return the modified, created, birth, updated, etc times.
   bool getFileTimes(PlatformTime& times);
-
-  /// Change the file times.
-  bool setFileTimes(const PlatformTime& times);
 
   /// Read a number of bytes into a buffer.
   ssize_t read(void* buf, size_t nbyte);

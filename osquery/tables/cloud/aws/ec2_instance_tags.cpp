@@ -25,16 +25,33 @@ namespace model = Aws::EC2::Model;
 
 QueryData genEc2InstanceTags(QueryContext& context) {
   QueryData results;
-  std::string instance_id, region;
-  getInstanceIDAndRegion(instance_id, region);
+
+  auto opt_instance_info = getInstanceIDAndRegion();
+
+  if (!opt_instance_info.has_value()) {
+    LOG(WARNING) << "Failed to retrieve region and instance id";
+    return results;
+  }
+
+  const auto& [instance_id, region] = *opt_instance_info;
+
   if (instance_id.empty() || region.empty()) {
+    LOG(WARNING) << "Instance id and region are empty, returning no results";
+    return results;
+  }
+
+  auto aws_region_res = AWSRegion::make(region, false);
+
+  if (aws_region_res.isError()) {
+    LOG(WARNING) << "Invalid region used to get EC2 instance tag: "
+                 << aws_region_res.getError();
     return results;
   }
 
   std::shared_ptr<ec2::EC2Client> client;
-  Status s = makeAWSClient<ec2::EC2Client>(client, region, false);
+  Status s = makeAWSClient<ec2::EC2Client>(client, aws_region_res.get(), false);
   if (!s.ok()) {
-    VLOG(1) << "Failed to create EC2 client: " << s.what();
+    LOG(WARNING) << "Failed to create EC2 client: " << s.what();
     return results;
   }
 

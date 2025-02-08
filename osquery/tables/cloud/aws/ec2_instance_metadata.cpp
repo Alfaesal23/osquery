@@ -22,6 +22,8 @@
 namespace pt = boost::property_tree;
 
 namespace osquery {
+
+DECLARE_bool(aws_disable_imdsv1_fallback);
 namespace tables {
 
 /**
@@ -39,7 +41,7 @@ class Ec2MetaData {
    *
    * @return HTTP body.
    */
-  std::string doGet() const;
+  boost::optional<std::string> doGet() const;
 
   /**
    * @brief Extract relevant data from return API call, pure virtual
@@ -61,8 +63,15 @@ class Ec2MetaData {
    * @param r The row to which the value need to be added
    */
   void get(Row& r) const {
-    const std::string http_body = doGet();
-    extractResult(http_body, r);
+    auto opt_http_body = doGet();
+
+    if (!opt_http_body.has_value()) {
+      LOG(ERROR) << "Failed to get instance metadata from the metadata service "
+                 << url_suffix_;
+      return;
+    }
+
+    extractResult(*opt_http_body, r);
   }
 };
 
@@ -124,14 +133,22 @@ class JSONEc2MetaData : public Ec2MetaData {
   virtual ~JSONEc2MetaData() {}
 };
 
-std::string Ec2MetaData::doGet() const {
+boost::optional<std::string> Ec2MetaData::doGet() const {
   const static std::string ec2_metadata_url{kEc2MetadataUrl};
 
-  auto token = getIMDSToken();
+  auto opt_token = getIMDSToken();
   http::Request req(ec2_metadata_url + url_suffix_);
-  if (!token.empty()) {
-    req << http::Request::Header(kImdsTokenHeader, token);
+
+  if (opt_token.has_value()) {
+    req << http::Request::Header(kImdsTokenHeader, *opt_token);
+  } else if (FLAGS_aws_disable_imdsv1_fallback) {
+    /* If the IMDSv2 token cannot be retrieved and we disabled IMDSv1,
+       we cannot attempt to do a request, so return with empty results. */
+    VLOG(1) << "Could not retrieve an IMDSv2 token to request the instance id "
+               "and region. The IMDSv1 fallback is disabled";
+    return {};
   }
+
   http::Client::Options options;
   options.timeout(3);
   http::Client client(options);
@@ -140,24 +157,27 @@ std::string Ec2MetaData::doGet() const {
     http::Response res = client.get(req);
     boost::uint16_t http_status_code = res.status();
 
-    // Silently ignore 404
+    // Don't consider 404 an error, but log it
     if (http_status_code == 404) {
-      return "";
+      VLOG(1) << "The metadata service " << url_suffix_
+              << " could not be found";
+      return std::string();
     }
 
     // Log "hard" errors
     if (http_status_code != 200) {
       VLOG(1) << "Unexpected HTTP response for: " << url_suffix_
               << " Status: " << http_status_code;
-      return "";
+      return boost::none;
     }
 
     return res.body();
   } catch (std::system_error& e) {
     VLOG(1) << "Request for " << url_suffix_ << " failed: " << e.what();
+    return boost::none;
   }
 
-  return "";
+  return std::string();
 }
 
 void setRowField(const ColumnType sql_type,
@@ -209,9 +229,6 @@ void JSONEc2MetaData::extractResult(const std::string& http_body,
 
 QueryData genEc2Metadata(QueryContext& context) {
   QueryData results;
-  if (!isEc2Instance()) {
-    return results;
-  }
 
   const static std::vector<std::shared_ptr<Ec2MetaData>> fields(
       {std::make_shared<JSONEc2MetaData>(

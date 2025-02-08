@@ -27,9 +27,11 @@ osquery> .help
 Welcome to the osquery shell. Please explore your OS!
 You are connected to a transient 'in-memory' virtual database.
 
-.all [TABLE]       Select all from a table
-.bail ON|OFF       Stop after hitting an error; default OFF
-.echo ON|OFF       Turn command echo on or off
+.all [TABLE]     Select all from a table
+.bail ON|OFF     Stop after hitting an error
+.connect PATH    Connect to an osquery extension socket
+.disconnect      Disconnect from a connected extension socket
+.echo ON|OFF     Turn command echo on or off
 [...]
 osquery>
 ```
@@ -39,10 +41,10 @@ Try the meta-commands `.tables` and `.schema` to list all of the tables and thei
 ```text
 osquery> .schema process
 [...]
-CREATE TABLE process_memory_map(pid INTEGER, start TEXT, end TEXT, permissions TEXT, offset BIGINT, device TEXT, inode INTEGER, path TEXT, pseudo INTEGER);
-CREATE TABLE process_open_files(pid BIGINT, fd BIGINT, path TEXT);
-CREATE TABLE process_open_sockets(pid INTEGER, fd BIGINT, socket BIGINT, family INTEGER, protocol INTEGER, local_address TEXT, remote_address TEXT, local_port INTEGER, remote_port INTEGER, path TEXT);
-CREATE TABLE processes(pid BIGINT, name TEXT, path TEXT, cmdline TEXT, state TEXT, cwd TEXT, root TEXT, uid BIGINT, gid BIGINT, euid BIGINT, egid BIGINT, suid BIGINT, sgid BIGINT, on_disk INTEGER, wired_size BIGINT, resident_size BIGINT, phys_footprint BIGINT, user_time BIGINT, system_time BIGINT, start_time BIGINT, parent BIGINT, pgroup BIGINT, nice INTEGER);
+CREATE TABLE process_memory_map(`pid` INTEGER, `start` TEXT, `end` TEXT, `permissions` TEXT, `offset` BIGINT, `device` TEXT, `inode` INTEGER, `path` TEXT, `pseudo` INTEGER, PRIMARY KEY (`pid`)) WITHOUT ROWID;
+CREATE TABLE process_open_files(`pid` BIGINT, `fd` BIGINT, `path` TEXT, PRIMARY KEY (`pid`)) WITHOUT ROWID;
+CREATE TABLE process_open_sockets(`pid` INTEGER, `fd` BIGINT, `socket` BIGINT, `family` INTEGER, `protocol` INTEGER, `local_address` TEXT, `remote_address` TEXT, `local_port` INTEGER, `remote_port` INTEGER, `path` TEXT, `state` TEXT, `net_namespace` TEXT HIDDEN, PRIMARY KEY (`pid`, `fd`, `socket`, `family`, `protocol`, `local_address`, `remote_address`, `local_port`, `remote_port`, `path`, `state`, `net_namespace`)) WITHOUT ROWID;
+CREATE TABLE processes(`pid` BIGINT, `name` TEXT, `path` TEXT, `cmdline` TEXT, `state` TEXT, `cwd` TEXT, `root` TEXT, `uid` BIGINT, `gid` BIGINT, `euid` BIGINT, `egid` BIGINT, `suid` BIGINT, `sgid` BIGINT, `on_disk` INTEGER, `wired_size` BIGINT, `resident_size` BIGINT, `total_size` BIGINT, `user_time` BIGINT, `system_time` BIGINT, `disk_bytes_read` BIGINT, `disk_bytes_written` BIGINT, `start_time` BIGINT, `parent` BIGINT, `pgroup` BIGINT, `threads` INTEGER, `nice` INTEGER, `elevated_token` INTEGER HIDDEN, `secure_process` INTEGER HIDDEN, `protection_type` TEXT HIDDEN, `virtual_process` INTEGER HIDDEN, `elapsed_time` BIGINT HIDDEN, `handle_count` BIGINT HIDDEN, `percent_processor_time` BIGINT HIDDEN, `upid` BIGINT, `uppid` BIGINT, `cpu_type` INTEGER, `cpu_subtype` INTEGER, `translated` INTEGER, `cgroup_path` TEXT HIDDEN, PRIMARY KEY (`pid`)) WITHOUT ROWID;
 ```
 
 This [complete schema](https://osquery.io/schema/) for all supported platforms is available on the homepage. To see schema in your shell for tables foreign to your OS, like kernel modules on macOS, use the `--enable_foreign` [command line flag](../installation/cli-flags.md).
@@ -52,14 +54,14 @@ This [complete schema](https://osquery.io/schema/) for all supported platforms i
 On macOS (or Linux), select 1 process's pid, name, and path. Then change the display mode and issue the same query:
 
 ```text
-osquery> SELECT pid, name, path FROM processes LIMIT 1;
+osquery> SELECT pid, name, path WHERE pid>0 FROM processes LIMIT 1;
 +-----+---------+---------------+
 | pid | name    | path          |
 +-----+---------+---------------+
 | 1   | launchd | /sbin/launchd |
 +-----+---------+---------------+
 osquery> .mode line
-osquery> SELECT pid, name, path FROM processes LIMIT 1;
+osquery> SELECT pid, name, path WHERE pid>0 FROM processes LIMIT 1;
   pid = 1
  name = launchd
  path = /sbin/launchd
@@ -132,9 +134,9 @@ We can expand upon this later using subqueries and more tables.
 
 ### Tables with arguments
 
-Several tables, `file` for example, represent concepts that require arguments. Consider `SELECT * FROM file`: you do not want this to trigger a complete walk of the mounted file systems. It is an ambiguous concept without some sort of argument or input parameter. These tables, and their columns, are flagged by a *dropper icon* in the [schema documentation](https://osquery.io/schema/) as requiring a column or as using a column to generate additional information.
+Several tables, `file` for example, require arguments to be queried. Consider `SELECT * FROM file`: you would not want this to trigger a complete walk of the mounted file systems. The query must be constrained with some sort of argument or input parameter. Tables like this are indicated by a *pushpin icon* in the [schema documentation](https://osquery.io/schema/) next to the columns that act as arguments to constrain a query.
 
-Let's exercise the `file` table:
+As an example of this concept, let's exercise the `file` table:
 
 ```
 osquery> .mode line
@@ -369,6 +371,32 @@ The following trig functions: `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`
     </p>
     </details>
 
+- `version_compare(LEFT_VERSION, RIGHT_VERSION, COMPARE_FLAVOR)`: return `-1` if the left version is less than the right, `0` if they are equal, or `1` if the left version is greater than the right. `COMPARE_FLAVOR` is optional, and can be of value (`ARCH`, `DPKG`, or `RHEL`), which equates to the respective linux distribution package versioning. The default `COMPARE_FLAVOR` is semantic versioning.
+
+    <details>
+    <summary>Version Compare function example:</summary>
+    <p>
+
+      osquery> .mode line
+
+      osquery> select version_compare('1.0', '1.0');
+      version_compare('1.0', '1.0') = 0
+
+      osquery> select version_compare('4:1.1.0', '4:1.1.0-3', 'ARCH');
+      version_compare('4:1.1.0', '4:1.1.0-3', 1) = 0
+
+      osquery> select version_compare('50.4.1b', '50.4.1c');
+      version_compare('50.4.1b', '50.4.1c') = -1
+
+      osquery> select version_compare('1.0.0~rc2^2021', '1.0.0', 'RHEL');
+      version_compare('1.0.0~rc2^2021', '1.0.0', 3) = -1
+
+      osquery> select version_compare('1:1.2.13-2', '4.2.1', 'ARCH');
+      version_compare('1:1.2.13-2', '4.2.1', 1) = 1
+
+    </p>
+    </details>
+
 #### Hashing functions
 
 We have added `sha1`, `sha256`, and `md5` functions that take a single argument and return the hashed value.
@@ -461,7 +489,7 @@ There are also encoding functions available, to process query results.
 
     </p>
     </details>
-- `conditional_to_base64`: Encode a string if and only if the string contains non-ASCII characters.
+- `conditional_to_base64`: Encode a string if and only if the string contains non-printable ASCII characters. (Specifically, it considers `0x20` through `0x7e` printable)
     <details>
     <summary>Conditional Base64 encode example:</summary>
     <p>
@@ -474,8 +502,8 @@ There are also encoding functions available, to process query results.
       osquery> select conditional_to_base64(device_id) as device_id from cpu_info;
       device_id = CPU0
 
-      osquery> select conditional_to_base64(device_id + char(183)) as device_id from cpu_info;
-      device_id = 0
+      osquery> select conditional_to_base64(device_id || char(183)) as device_id from cpu_info;
+      device_id = Q1BVMMK3
 
     </p>
     </details>
@@ -495,6 +523,87 @@ There are also encoding functions available, to process query results.
 
       osquery> SELECT in_cidr_block('2001:db8::/48', '2001:db8:0:ffff:ffff:ffff:ffff:ffff');
       in_cidr_block('2001:db8::/48', '2001:db8:0:ffff:ffff:ffff:ffff:ffff') = 1
+
+    </p>
+    </details>
+
+#### Collations
+
+- `version`:
+
+    <details>
+    <summary>Version collation example:</summary>
+    <p>
+
+      osquery> .mode line
+
+      osquery> SELECT '1.0' = '1.0' COLLATE VERSION;
+      '1.0' = '1.0' COLLATE VERSION = 1
+
+      osquery> SELECT '50.4.1b' < '50.4.1c' COLLATE VERSION;
+      '50.4.1b' < '50.4.1c' COLLATE VERSION = 1
+
+      osquery> SELECT '20.10a' > '20.102' COLLATE VERSION;
+      '20.10a' > '20.102' COLLATE VERSION = 1
+    </p>
+    </details>
+
+- `version_arch`:
+
+    <details>
+    <summary>Version ARCH collation example:</summary>
+    <p>
+
+      osquery> .mode line
+
+      osquery> SELECT '4:2' = '4:2-1' COLLATE VERSION_ARCH;
+      '4:2' = '4:2-1' COLLATE VERSION_ARCH = 1
+
+      osquery> SELECT '2-2pre' < '2-2rc' COLLATE VERSION_ARCH;
+      '2-2pre' < '2-2rc' COLLATE VERSION_ARCH = 1
+
+      osquery> SELECT '42.2-1' > '42.1-2' COLLATE VERSION_ARCH;
+      '42.2-1' > '42.1-2' COLLATE VERSION_ARCH = 1
+
+    </p>
+    </details>
+
+- `version_dpkg`:
+
+    <details>
+    <summary>Version DPKG collation example:</summary>
+    <p>
+
+      osquery> .mode line
+
+      osquery> SELECT '1:2.0-10' = '1:2.0-10' COLLATE VERSION_DPKG;
+      '1:2.0-10' = '1:2.0-10' COLLATE VERSION_DPKG = 1
+
+      osquery> SELECT '22.07.5-2ubuntu1.3' < '22.07.5-2ubuntu1.4' COLLATE VERSION_DPKG;
+      '22.07.5-2ubuntu1.3' < '22.07.5-2ubuntu1.4' COLLATE VERSION_DPKG = 1
+
+      osquery> SELECT '2:8.2.3995-1ubuntu2.9' > '2:8.2.3995-1ubuntu2.3' COLLATE VERSION_DPKG;
+      '2:8.2.3995-1ubuntu2.9' > '2:8.2.3995-1ubuntu2.3' COLLATE VERSION_DPKG = 1
+
+    </p>
+    </details>
+
+- `version_rhel`:
+
+    <details>
+    <summary>Version RHEL collation example:</summary>
+    <p>
+
+      osquery> .mode line
+
+      osquery> SELECT '0.5.0~rc1^202' = '0.5.0~rc1^202' COLLATE VERSION_RHEL;
+      '0.5.0~rc1^202' = '0.5.0~rc1^202' COLLATE VERSION_RHEL = 1
+
+      osquery> SELECT '1.1.0~BETA2' < '1.1.0~CR1' COLLATE VERSION_RHEL;
+      '1.1.0~BETA2' < '1.1.0~CR1' COLLATE VERSION_RHEL = 1
+
+      osquery> SELECT '1.0.0' > '1.0.0~rc2' COLLATE VERSION_RHEL;
+      '1.0.0' > '1.0.0~rc2' COLLATE VERSION_RHEL = 1
 
     </p>
     </details>

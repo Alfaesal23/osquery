@@ -11,8 +11,7 @@
 
 #include <osquery/utils/info/platform_type.h>
 
-namespace osquery {
-namespace table_tests {
+namespace osquery::table_tests {
 
 class Secureboot : public testing::Test {
  protected:
@@ -22,16 +21,47 @@ class Secureboot : public testing::Test {
 };
 
 TEST_F(Secureboot, test_sanity) {
-  QueryData data = execute_query("select * from secureboot");
+  bool secureboot_supported{false};
 
-  ASSERT_EQ(data.size(), 1ul);
+  {
+    auto platform_info_rows =
+        execute_query("SELECT firmware_type FROM platform_info;");
 
-  ValidationMap row_map = {
+    ASSERT_EQ(platform_info_rows.size(), 1);
+
+    const auto& platform_info = platform_info_rows[0];
+    ASSERT_EQ(platform_info.count("firmware_type"), 1);
+
+    if (isPlatform(PlatformType::TYPE_OSX)) {
+#ifdef __aarch64__
+      secureboot_supported = false;
+#endif
+    } else {
+      secureboot_supported = platform_info.at("firmware_type") == "uefi";
+    }
+  }
+
+  if (!secureboot_supported) {
+    return;
+  }
+
+  auto secureboot_data = execute_query("SELECT * FROM secureboot;");
+
+  // Values should only ever be integers or empty:
+  ValidationMap row_map{
       {"secure_boot", IntOrEmpty},
-      {"setup_mode", IntOrEmpty},
   };
-  validate_rows(data, row_map);
+
+  // Windows and Linux have setup_mode, macOS has secure_mode:
+  if (isPlatform(PlatformType::TYPE_WINDOWS) ||
+      isPlatform(PlatformType::TYPE_LINUX)) {
+    row_map.emplace("setup_mode", IntOrEmpty);
+  } else if (isPlatform(PlatformType::TYPE_OSX)) {
+    row_map.emplace("secure_mode", IntOrEmpty);
+  }
+
+  // Check that the above assumptions are true:
+  validate_rows(secureboot_data, row_map);
 }
 
-} // namespace table_tests
-} // namespace osquery
+} // namespace osquery::table_tests

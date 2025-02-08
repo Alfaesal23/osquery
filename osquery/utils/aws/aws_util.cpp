@@ -34,10 +34,13 @@
 #include <aws/sts/model/Credentials.h>
 
 #include <osquery/core/flags.h>
+#include <osquery/core/shutdown.h>
+#include <osquery/logger/data_logger.h>
 #include <osquery/logger/logger.h>
+#include <osquery/utils/aws/aws_util.h>
+#include <osquery/utils/expected/expected.h>
 #include <osquery/utils/json/json.h>
 #include <osquery/utils/system/time.h>
-#include <osquery/utils/aws/aws_util.h>
 
 namespace pt = boost::property_tree;
 
@@ -52,7 +55,7 @@ FLAG(string,
      aws_profile_name,
      "",
      "AWS profile for authentication and region configuration");
-FLAG(string, aws_region, "", "AWS region");
+FLAG(string, aws_region, "", "Default AWS region for all services");
 FLAG(string, aws_sts_arn_role, "", "AWS STS ARN role");
 FLAG(string, aws_sts_region, "", "AWS STS region");
 FLAG(string, aws_sts_session_name, "default", "AWS STS session name");
@@ -82,9 +85,35 @@ FLAG(string,
      "Proxy password for use in AWS client config");
 FLAG(bool, aws_debug, false, "Enable AWS SDK debug logging");
 
+FLAG(uint32,
+     aws_imdsv2_request_attempts,
+     3,
+     "How many attempts to do at requesting an IMDSv2 token");
+
+FLAG(uint32,
+     aws_imdsv2_request_interval,
+     3,
+     "Base seconds to wait between attempts at requesting an IMDSv2 token. "
+     "Scales quadratically with the number of attempts");
+
+FLAG(bool,
+     aws_disable_imdsv1_fallback,
+     false,
+     "Whether to disable support for IMDSv1 and fail if an IMDSv2 token could "
+     "not be retrieved");
+
+CLI_FLAG(bool,
+         aws_enforce_fips,
+         false,
+         "Whether to enforce AWS FIPS endpoints for all services or not");
+
 /// EC2 instance latestmetadata URL
 const std::string kEc2MetadataUrl =
     "http://" + http::kInstanceMetadataAuthority + "/latest/";
+
+/// EC2 instance identity document URL
+const std::string kEc2IdentityDocument =
+    kEc2MetadataUrl + "dynamic/instance-identity/document";
 
 /// Hypervisor UUID file
 const std::string kHypervisorUuid = "/sys/hypervisor/uuid";
@@ -103,16 +132,172 @@ const std::string kImdsTokenTtlDefaultValue = "21600";
 
 /// Map of AWS region name to AWS::Region enum.
 static const std::set<std::string> kAwsRegions = {
-    "af-south-1",     "ap-east-1",     "ap-northeast-1", "ap-northeast-2",
-    "ap-northeast-3", "ap-south-1",    "ap-southeast-1", "ap-southeast-2",
-    "ca-central-1",   "cn-north-1",    "cn-northwest-1", "eu-central-1",
-    "eu-north-1",     "eu-south-1",    "eu-west-1",      "eu-west-2",
-    "eu-west-3",      "me-south-1",    "sa-east-1",      "us-east-1",
-    "us-east-2",      "us-gov-east-1", "us-gov-west-1",  "us-west-1",
-    "us-west-2"};
+    "af-south-1",     "ap-south-2",     "ap-east-1",     "ap-northeast-1",
+    "ap-northeast-2", "ap-northeast-3", "ap-south-1",    "ap-southeast-1",
+    "ap-southeast-2", "ap-southeast-3", "ca-central-1",  "cn-north-1",
+    "cn-northwest-1", "eu-central-1",   "eu-central-2",  "eu-north-1",
+    "eu-south-1",     "eu-south-2",     "eu-west-1",     "eu-west-2",
+    "eu-west-3",      "me-central-1",   "me-south-1",    "sa-east-1",
+    "us-east-1",      "us-east-2",      "us-gov-east-1", "us-gov-west-1",
+    "us-west-1",      "us-west-2"};
+
+/// Map of AWS region names that support FIPS,
+/// taken from https://aws.amazon.com/compliance/fips/
+static const std::set<std::string> kAwsFipsRegions = {"us-east-1",
+                                                      "us-east-2",
+                                                      "us-gov-east-1",
+                                                      "us-west-1",
+                                                      "us-west-2",
+                                                      "us-gov-west-1"};
 
 // Default AWS region to use when no region set in flags or profile
 static RegionName kDefaultAWSRegion = Aws::Region::US_EAST_1;
+
+// To protect the access to the AWS instance id and region that are being cached
+static std::mutex cached_values_mutex;
+
+DECLARE_string(aws_firehose_region);
+DECLARE_string(aws_kinesis_region);
+
+namespace {
+bool validateIMDSV2RequestAttempts(const char* flagname, std::uint32_t value) {
+  if (value == 0) {
+    std::string error_message =
+        "Only values higher than 0 are supported for " + std::string(flagname);
+    osquery::systemLog(error_message);
+    std::cerr << error_message << std::endl;
+
+    return false;
+  } // namespace osquery
+
+  return true;
+}
+
+std::string awsServiceTypeToString(const AWSServiceType service_type) {
+  switch (service_type) {
+  case AWSServiceType::Kinesis: {
+    return "kinesis";
+  }
+  case AWSServiceType::Firehose: {
+    return "firehose";
+  }
+  case AWSServiceType::STS: {
+    return "sts";
+  }
+  case AWSServiceType::EC2: {
+    return "ec2";
+  }
+  }
+
+  return "unsupported";
+}
+
+Status validateRegion(const std::string& region) {
+  if (!region.empty()) {
+    auto index = kAwsRegions.find(region);
+    if (index != kAwsRegions.end()) {
+      return Status::success();
+    } else {
+      return Status::failure("Invalid region " + region);
+    }
+  }
+
+  return Status::success();
+}
+
+Status getAWSRegionFromProfile(std::string& region) {
+  pt::ptree tree;
+  try {
+    auto profile_dir = Aws::Auth::ProfileConfigFileAWSCredentialsProvider::
+        GetProfileDirectory();
+    pt::ini_parser::read_ini(profile_dir + "/config", tree);
+  } catch (const pt::ini_parser::ini_parser_error& e) {
+    return Status(1, std::string("Error reading profile file: ") + e.what());
+  }
+
+  // Profile names are prefixed with "profile ", except for "default".
+  std::string profile_key = FLAGS_aws_profile_name;
+  if (!profile_key.empty() && profile_key != "default") {
+    profile_key = "profile " + profile_key;
+  } else {
+    profile_key = "default";
+  }
+
+  auto section_it = tree.find(profile_key);
+  if (section_it == tree.not_found()) {
+    return Status(1, "AWS profile not found: " + FLAGS_aws_profile_name);
+  }
+
+  auto key_it = section_it->second.find("region");
+  if (key_it == section_it->second.not_found()) {
+    return Status(
+        1, "AWS region not found for profile: " + FLAGS_aws_profile_name);
+  }
+
+  std::string region_string = key_it->second.data();
+  auto index = kAwsRegions.find(region_string);
+  if (index != kAwsRegions.end()) {
+    region = region_string;
+  } else {
+    return Status(1, "Invalid aws_region in profile: " + region_string);
+  }
+
+  return Status(0);
+}
+
+Status getAWSRegion(std::string& region, bool validate_region) {
+  if (region.empty()) {
+    region = FLAGS_aws_region;
+  }
+
+  if (!region.empty()) {
+    if (validate_region) {
+      auto status = validateRegion(region);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+
+    return Status::success();
+  }
+
+  // Try finding in profile.
+  auto s = getAWSRegionFromProfile(region);
+  if (s.ok() || !FLAGS_aws_profile_name.empty()) {
+    VLOG(1) << "Using AWS region from profile: " << region;
+    return s;
+  }
+
+  // Use the default region.
+  region = kDefaultAWSRegion;
+  VLOG(1) << "Using default AWS region: " << region;
+  return Status(0);
+}
+}; // namespace
+
+DEFINE_validator(aws_imdsv2_request_attempts, validateIMDSV2RequestAttempts);
+
+AWSRegion::AWSRegion(const std::string& region) : region_(region) {}
+
+Expected<AWSRegion, AWSRegionError> AWSRegion::make(
+    const std::string& suggested_region, bool validate_region) {
+  AWSRegion aws_region{suggested_region};
+
+  auto status = getAWSRegion(aws_region.region_, validate_region);
+  if (!status.ok()) {
+    return Expected<AWSRegion, AWSRegionError>::failure(status.getMessage());
+  }
+
+  if (FLAGS_aws_enforce_fips) {
+    if (kAwsFipsRegions.find(aws_region.region_) == kAwsFipsRegions.end()) {
+      return Expected<AWSRegion, AWSRegionError>::failure(
+          AWSRegionError::NotFIPSCompliant,
+          "Region " + aws_region.region_ + " is not FIPS compliant");
+    }
+  }
+
+  return aws_region;
+}
 
 std::shared_ptr<Aws::Http::HttpClient>
 OsqueryHttpClientFactory::CreateHttpClient(
@@ -172,17 +357,38 @@ std::shared_ptr<Aws::Http::HttpResponse> OsqueryHttpClient::MakeRequest(
   auto response = std::make_shared<Standard::StandardHttpResponse>(request_ptr);
   http::Response resp;
 
+  if (osquery::shutdownRequested()) {
+    /* This is technically a client error, but some AWS requests
+       consider any client error as retryable.
+       Since we want to stop the retries,
+       we use instead a non-retryable response code,
+       although we did not have any response.
+       We also log the reason of the failure to provide more information */
+
+    response->SetResponseCode(Aws::Http::HttpResponseCode::BLOCKED);
+    LOG(WARNING) << "An AWS request has been blocked since a shutdown has been "
+                    "requested";
+
+    return response;
+  }
+
   try {
     switch (request.GetMethod()) {
     case Aws::Http::HttpMethod::HTTP_GET:
       resp = client.get(req);
       break;
-    case Aws::Http::HttpMethod::HTTP_POST:
-      resp = client.post(req, body, request.GetContentType());
+    case Aws::Http::HttpMethod::HTTP_POST: {
+      std::string content_type =
+          request.HasContentType() ? request.GetContentType() : "";
+      resp = client.post(req, body, content_type);
       break;
-    case Aws::Http::HttpMethod::HTTP_PUT:
-      resp = client.put(req, body, request.GetContentType());
+    }
+    case Aws::Http::HttpMethod::HTTP_PUT: {
+      std::string content_type =
+          request.HasContentType() ? request.GetContentType() : "";
+      resp = client.put(req, body, content_type);
       break;
+    }
     case Aws::Http::HttpMethod::HTTP_HEAD:
       resp = client.head(req);
       break;
@@ -225,8 +431,8 @@ std::shared_ptr<Aws::Http::HttpResponse> OsqueryHttpClient::MakeRequest(
                       request.GetMethod())
                << " request to URL (" << url << "): " << e.what();
 
-    response->SetResponseCode(
-        static_cast<Aws::Http::HttpResponseCode>(resp.status()));
+    response->SetClientErrorType(Aws::Client::CoreErrors::NETWORK_CONNECTION);
+    response->SetClientErrorMessage(e.what());
   }
 
   return response;
@@ -273,7 +479,16 @@ OsquerySTSAWSCredentialsProvider::GetAWSCredentials() {
       initAwsSdk();
     }
 
-    Status s = makeAWSClient<Aws::STS::STSClient>(client_, "", false);
+    auto aws_region_res = AWSRegion::make(FLAGS_aws_sts_region);
+
+    if (aws_region_res.isError()) {
+      LOG(WARNING) << "Failed to generate STS Credentials: "
+                   << aws_region_res.getError();
+      return Aws::Auth::AWSCredentials("", "");
+    }
+
+    Status s = makeAWSClient<Aws::STS::STSClient>(
+        client_, aws_region_res.get(), false);
     if (!s.ok()) {
       LOG(WARNING) << "Error creating AWS client: " << s.what();
       return Aws::Auth::AWSCredentials("", "");
@@ -292,11 +507,28 @@ OsquerySTSAWSCredentialsProvider::GetAWSCredentials() {
       access_key_id_ = sts_result.GetCredentials().GetAccessKeyId();
       secret_access_key_ = sts_result.GetCredentials().GetSecretAccessKey();
       session_token_ = sts_result.GetCredentials().GetSessionToken();
+
       // Calculate when our credentials will expire.
       token_expire_time_ = current_time + FLAGS_aws_sts_timeout;
     } else {
-      LOG(ERROR) << "Failed to create STS temporary credentials: "
-                    "No STS policy exists for the AWS user/role";
+      const auto& error = sts_outcome.GetError();
+
+      std::stringstream error_message;
+
+      error_message << static_cast<int>(error.GetErrorType());
+
+      if (error.GetResponseCode() !=
+          Aws::Http::HttpResponseCode::REQUEST_NOT_MADE) {
+        error_message << ", HTTP responde code: "
+                      << static_cast<int>(error.GetResponseCode());
+      }
+
+      if (!error.GetMessage().empty()) {
+        error_message << ", error message: " << error.GetMessage();
+      }
+
+      LOG(ERROR) << "Failed to create STS temporary credentials, error type: "
+                 << error_message.rdbuf();
     }
   }
   return Aws::Auth::AWSCredentials(
@@ -326,46 +558,6 @@ OsqueryAWSCredentialsProviderChain::OsqueryAWSCredentialsProviderChain(bool sts)
       std::make_shared<Aws::Auth::InstanceProfileCredentialsProvider>());
 }
 
-Status getAWSRegionFromProfile(std::string& region) {
-  pt::ptree tree;
-  try {
-    auto profile_dir = Aws::Auth::ProfileConfigFileAWSCredentialsProvider::
-        GetProfileDirectory();
-    pt::ini_parser::read_ini(profile_dir + "/config", tree);
-  } catch (const pt::ini_parser::ini_parser_error& e) {
-    return Status(1, std::string("Error reading profile file: ") + e.what());
-  }
-
-  // Profile names are prefixed with "profile ", except for "default".
-  std::string profile_key = FLAGS_aws_profile_name;
-  if (!profile_key.empty() && profile_key != "default") {
-    profile_key = "profile " + profile_key;
-  } else {
-    profile_key = "default";
-  }
-
-  auto section_it = tree.find(profile_key);
-  if (section_it == tree.not_found()) {
-    return Status(1, "AWS profile not found: " + FLAGS_aws_profile_name);
-  }
-
-  auto key_it = section_it->second.find("region");
-  if (key_it == section_it->second.not_found()) {
-    return Status(
-        1, "AWS region not found for profile: " + FLAGS_aws_profile_name);
-  }
-
-  std::string region_string = key_it->second.data();
-  auto index = kAwsRegions.find(region_string);
-  if (index != kAwsRegions.end()) {
-    region = region_string;
-  } else {
-    return Status(1, "Invalid aws_region in profile: " + region_string);
-  }
-
-  return Status(0);
-}
-
 void initAwsSdk() {
   static std::once_flag once_flag;
   try {
@@ -384,56 +576,56 @@ void initAwsSdk() {
   }
 }
 
-void getInstanceIDAndRegion(std::string& instance_id, std::string& region) {
-  static std::atomic<bool> checked(false);
+boost::optional<std::pair<std::string, std::string>> getInstanceIDAndRegion() {
   static std::string cached_id;
   static std::string cached_region;
-  if (checked || !isEc2Instance()) {
-    // Return if already checked or this is not EC2 instance
-    instance_id = cached_id;
-    region = cached_region;
-    return;
+  static bool init_successfully = false;
+
+  std::lock_guard<std::mutex> lock(cached_values_mutex);
+
+  if (init_successfully) {
+    return {{cached_id, cached_region}};
   }
 
-  static std::once_flag once_flag;
-  std::call_once(once_flag, []() {
-    if (checked) {
-      return;
-    }
+  initAwsSdk();
+  http::Request req(kEc2IdentityDocument);
+  auto opt_token = getIMDSToken();
+  if (opt_token.has_value()) {
+    req << http::Request::Header(kImdsTokenHeader, *opt_token);
+  } else if (FLAGS_aws_disable_imdsv1_fallback) {
+    /* If the IMDSv2 token cannot be retrieved and we disabled IMDSv1,
+       we cannot attempt to do a request, so return with empty results. */
+    VLOG(1) << "Could not retrieve an IMDSv2 token to request the instance id "
+               "and region. The IMDSv1 fallback is disabled";
+    return boost::none;
+  }
 
-    initAwsSdk();
-    http::Request req(kEc2MetadataUrl + "dynamic/instance-identity/document");
-    auto token = getIMDSToken();
-    if (!token.empty()) {
-      req << http::Request::Header(kImdsTokenHeader, token);
-    }
-    http::Client::Options options;
-    options.timeout(3);
-    http::Client client(options);
+  http::Client::Options options;
+  options.timeout(3);
+  http::Client client(options);
 
-    try {
-      http::Response res = client.get(req);
-      if (res.status() == 200) {
-        pt::ptree tree;
-        std::stringstream ss(res.body());
-        pt::read_json(ss, tree);
-        cached_id = tree.get<std::string>("instanceId", ""),
-        cached_region = tree.get<std::string>("region", ""),
-        VLOG(1) << "EC2 instance ID: " << cached_id
-                << ". Region: " << cached_region;
-      }
-    } catch (const std::system_error& e) {
-      // Assume that this is not EC2 instance
-      VLOG(1) << "Error getting EC2 instance information: " << e.what();
+  try {
+    http::Response res = client.get(req);
+    if (res.status() == 200) {
+      pt::ptree tree;
+      std::stringstream ss(res.body());
+      pt::read_json(ss, tree);
+      cached_id = tree.get<std::string>("instanceId", ""),
+      cached_region = tree.get<std::string>("region", ""),
+      VLOG(1) << "EC2 instance ID: " << cached_id
+              << ". Region: " << cached_region;
     }
-    checked = true;
-  });
+  } catch (const std::system_error& e) {
+    VLOG(1) << "Error getting EC2 instance information: " << e.what();
+    return boost::none;
+  }
 
-  instance_id = cached_id;
-  region = cached_region;
+  init_successfully = true;
+
+  return {{cached_id, cached_region}};
 }
 
-std::string getIMDSToken() {
+boost::optional<std::string> getIMDSToken() {
   std::string token;
   http::Request req(kEc2MetadataUrl + kImdsTokenResource);
   http::Client::Options options;
@@ -441,94 +633,72 @@ std::string getIMDSToken() {
   http::Client client(options);
   req << http::Request::Header(kImdsTokenTtlHeader, kImdsTokenTtlDefaultValue);
 
-  try {
-    http::Response res = client.put(req, "", "");
-    token = res.status() == 200 ? res.body() : "";
-  } catch (const std::system_error& e) {
-    VLOG(1) << "Request for " << kImdsTokenResource << " failed:" << e.what();
+  std::uint32_t attempts = 0;
+  std::uint32_t interval = FLAGS_aws_imdsv2_request_interval;
+  while (attempts < FLAGS_aws_imdsv2_request_attempts) {
+    try {
+      http::Response res = client.put(req, "", "");
+      token = res.status() == 200 ? res.body() : "";
+    } catch (const std::system_error& e) {
+      VLOG(1) << "Request for " << kImdsTokenResource
+              << " failed: " << e.what();
+    } catch (const std::runtime_error& e) {
+      VLOG(1) << "Request for " << kImdsTokenResource
+              << " failed: " << e.what();
+    }
+
+    if (token.empty()) {
+      if (attempts < FLAGS_aws_imdsv2_request_attempts) {
+        auto should_shutdown =
+            osquery::waitTimeoutOrShutdown(std::chrono::seconds(interval));
+        if (should_shutdown) {
+          return boost::none;
+        }
+
+        interval *= FLAGS_aws_imdsv2_request_interval;
+        ++attempts;
+      }
+      continue;
+    }
+
+    break;
   }
+
+  if (attempts == FLAGS_aws_imdsv2_request_attempts) {
+    LOG(ERROR) << "Failed " << FLAGS_aws_imdsv2_request_attempts
+               << " attempts at retrieving an IMDSv2 token";
+    return boost::none;
+  }
+
   return token;
 }
 
-bool isEc2Instance() {
-  static std::atomic<bool> checked(false);
-  static std::atomic<bool> is_ec2_instance(false);
-  if (checked) {
-    return is_ec2_instance; // Return if already checked
+Status setAwsClientConfig(const AWSRegion& region,
+                          const AWSServiceType service_type,
+                          const std::string& endpoint_override,
+                          Aws::Client::ClientConfiguration& client_config) {
+  client_config.region = region.getRegion();
+
+  if (FLAGS_aws_enforce_fips) {
+    if (!endpoint_override.empty()) {
+      return Status::failure(
+          "Cannot override the endpoint when FIPS is enforced");
+    }
+
+    enableFIPSInClientConfig(service_type, client_config);
+
+    VLOG(1) << "Enforcing FIPS for " << awsServiceTypeToString(service_type)
+            << " client in region " << client_config.region;
+  } else {
+    VLOG(1) << "Configuring " << awsServiceTypeToString(service_type)
+            << " client in region " << client_config.region;
+    client_config.endpointOverride = endpoint_override;
+
+    // Setup any proxy options on the config if desired
+    setAWSProxy(client_config);
   }
 
-  static std::once_flag once_flag;
-  std::call_once(once_flag, []() {
-    if (checked) {
-      return;
-    }
-    checked = true;
-
-    std::ifstream fd(kHypervisorUuid, std::ifstream::in);
-    if (fd && !(fd.get() == 'e' && fd.get() == 'c' && fd.get() == '2')) {
-      return; // Not EC2 instance
-    }
-
-    auto token = getIMDSToken();
-    http::Request req(kEc2MetadataUrl);
-    if (!token.empty()) {
-      req << http::Request::Header(kImdsTokenHeader, token);
-    }
-    http::Client::Options options;
-    options.timeout(3);
-    http::Client client(options);
-
-    try {
-      http::Response res = client.get(req);
-      if (res.status() == 200) {
-        is_ec2_instance = true;
-      }
-    } catch (const std::system_error& e) {
-      // Assume that this is not EC2 instance
-      VLOG(1) << "Error checking if this is EC2 instance: " << e.what();
-    } catch (const std::runtime_error& e) {
-      VLOG(1) << "Error checking if this is EC2 instance: " << e.what();
-    }
-  });
-
-  return is_ec2_instance;
-}
-
-Status getAWSRegion(std::string& region, bool sts, bool validate_region) {
-  // First try using the explicit region flags (STS or otherwise).
-  if (sts && !FLAGS_aws_sts_region.empty()) {
-    auto index = kAwsRegions.find(FLAGS_aws_sts_region);
-    if (index != kAwsRegions.end() || !validate_region) {
-      VLOG(1) << "Using AWS STS region from flag: " << FLAGS_aws_sts_region;
-      region = FLAGS_aws_sts_region;
-      return Status(0);
-    } else {
-      return Status(1, "Invalid aws_region specified: " + FLAGS_aws_sts_region);
-    }
-  }
-
-  if (!FLAGS_aws_region.empty()) {
-    auto index = kAwsRegions.find(FLAGS_aws_region);
-    if (index != kAwsRegions.end() || !validate_region) {
-      VLOG(1) << "Using AWS region from flag: " << FLAGS_aws_region;
-      region = FLAGS_aws_region;
-      return Status(0);
-    } else {
-      return Status(1, "Invalid aws_region specified: " + FLAGS_aws_region);
-    }
-  }
-
-  // Try finding in profile.
-  auto s = getAWSRegionFromProfile(region);
-  if (s.ok() || !FLAGS_aws_profile_name.empty()) {
-    VLOG(1) << "Using AWS region from profile: " << region;
-    return s;
-  }
-
-  // Use the default region.
-  region = kDefaultAWSRegion;
-  VLOG(1) << "Using default AWS region: " << region;
-  return Status(0);
+  return Status::success();
 }
 
 Status appendLogTypeToJson(const std::string& log_type, std::string& log) {
@@ -562,7 +732,7 @@ Status appendLogTypeToJson(const std::string& log_type, std::string& log) {
   log = output.str();
 
   // Get rid of newline
-  if (!log.empty()) {
+  if (!log.empty() && log.back() == '\n') {
     log.pop_back();
   }
   return Status::success();
@@ -577,5 +747,19 @@ void setAWSProxy(Aws::Client::ClientConfiguration& config) {
     config.proxyUserName = FLAGS_aws_proxy_username;
     config.proxyPassword = FLAGS_aws_proxy_password;
   }
+}
+
+void enableFIPSInClientConfig(const AWSServiceType service_type,
+                              Aws::Client::ClientConfiguration& config) {
+  // Gov FIPS endpoints for Kinesis, EC2, STS are used as-is, do nothing
+  if (config.region.rfind("us-gov", 0) == 0 &&
+      (service_type == AWSServiceType::Kinesis ||
+       service_type == AWSServiceType::EC2 ||
+       service_type == AWSServiceType::STS)) {
+    return;
+  }
+
+  config.endpointOverride = awsServiceTypeToString(service_type) + "-fips." +
+                            config.region + ".amazonaws.com";
 }
 } // namespace osquery

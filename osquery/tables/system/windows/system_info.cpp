@@ -38,9 +38,11 @@ QueryData genSystemInfo(QueryContext& context) {
 
   const auto wmiSystemReq =
       WmiRequest::CreateWmiRequest("select * from Win32_ComputerSystem");
+  auto wmiExecutedSuccessful = wmiSystemReq.isValue();
   const auto wmiSystemReqProc =
       WmiRequest::CreateWmiRequest("select * from Win32_Processor");
-  if (wmiSystemReq && wmiSystemReqProc && !wmiSystemReq->results().empty() &&
+  wmiExecutedSuccessful &= wmiSystemReqProc.isValue();
+  if (wmiExecutedSuccessful && !wmiSystemReq->results().empty() &&
       !wmiSystemReqProc->results().empty()) {
     const std::vector<WmiResultItem>& wmiResults = wmiSystemReq->results();
     const std::vector<WmiResultItem>& wmiResultsProc =
@@ -48,12 +50,33 @@ QueryData genSystemInfo(QueryContext& context) {
     long numProcs = 0;
     wmiResults[0].GetLong("NumberOfLogicalProcessors", numProcs);
     r["cpu_logical_cores"] = INTEGER(numProcs);
+    wmiResults[0].GetLong("NumberOfProcessors", numProcs);
+    r["cpu_sockets"] = INTEGER(numProcs);
     wmiResultsProc[0].GetLong("NumberOfCores", numProcs);
     r["cpu_physical_cores"] = INTEGER(numProcs);
     wmiResults[0].GetString("Manufacturer", r["hardware_vendor"]);
     wmiResults[0].GetString("Model", r["hardware_model"]);
+
+    // For Lenovo models, the hardware_model property is not set propertly.
+    // Instead we can get the required info from the Win32_ComputerSystemProduct
+    // table.
+    std::string lcModel = r["hardware_vendor"];
+    std::transform(lcModel.begin(), lcModel.end(), lcModel.begin(), ::tolower);
+    if (lcModel == "lenovo") {
+      std::string version = r["hardware_model"];
+      const auto wmiSystemProductReq = WmiRequest::CreateWmiRequest(
+          "select * from Win32_ComputerSystemProduct");
+      if (wmiSystemProductReq.isValue() &&
+          !wmiSystemProductReq->results().empty()) {
+        const std::vector<WmiResultItem>& wmiProductResults =
+            wmiSystemProductReq->results();
+        wmiProductResults[0].GetString("Version", r["hardware_model"]);
+        r["hardware_version"] = version;
+      }
+    }
   } else {
     r["cpu_logical_cores"] = "-1";
+    r["cpu_sockets"] = "-1";
     r["cpu_physical_cores"] = "-1";
     r["hardware_vendor"] = "-1";
     r["hardware_model"] = "-1";

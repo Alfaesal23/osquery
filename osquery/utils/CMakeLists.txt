@@ -23,7 +23,6 @@ function(osqueryUtilsMain)
   add_subdirectory("debug")
   add_subdirectory("expected")
   add_subdirectory("conversions")
-  add_subdirectory("versioning")
   add_subdirectory("schemer")
   add_subdirectory("ycloud")
 
@@ -36,6 +35,11 @@ function(osqueryUtilsMain)
   endif()
 
   generateOsqueryUtils()
+
+  if(DEFINED PLATFORM_MACOS)
+    generateOsqueryUtilsPlist()
+    generateOsqueryUtilsSystemProfiler()
+  endif()
 endfunction()
 
 function(generateOsqueryUtils)
@@ -46,17 +50,10 @@ function(generateOsqueryUtils)
     rot13.cpp
   )
 
-  if(DEFINED PLATFORM_MACOS)
-    list(APPEND source_files
-      darwin/plist.mm
-    )
-  endif()
-
   if(DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
       windows/shellitem.cpp
       windows/lzxpress.cpp
-      windows/shelllnk.cpp
     )
   endif()
 
@@ -94,7 +91,7 @@ function(generateOsqueryUtils)
 
   if(DEFINED PLATFORM_MACOS)
     set(platform_public_header_files
-      darwin/plist.h
+      darwin/iokit_helpers.h
     )
 
     generateIncludeNamespace(osquery_utils "osquery/utils" "FULL_PATH" ${platform_public_header_files})
@@ -104,7 +101,6 @@ function(generateOsqueryUtils)
     set(platform_public_header_files
       windows/shellitem.h
       windows/lzxpress.h
-      windows/shelllnk.h
     )
 
     generateIncludeNamespace(osquery_utils "osquery/utils" "FULL_PATH" ${platform_public_header_files})
@@ -117,7 +113,46 @@ function(generateOsqueryUtils)
   generateIncludeNamespace(osquery_utils_attribute "osquery/utils" "FILE_ONLY" ${attribute_public_header_files})
 
   add_test(NAME osquery_utils_utilstests-test COMMAND osquery_utils_utilstests-test)
+endfunction()
 
+function(generateOsqueryUtilsPlist)
+  list(APPEND source_files
+    darwin/plist.mm
+  )
+
+  add_osquery_library(osquery_utils_plist ${source_files})
+
+  target_link_libraries(osquery_utils_plist PRIVATE
+    osquery_cxx_settings
+    osquery_filesystem
+    thirdparty_boost
+  )
+
+  set(platform_public_header_files
+    darwin/plist.h
+  )
+
+  generateIncludeNamespace(osquery_utils "osquery/utils" "FULL_PATH" ${platform_public_header_files})
+endfunction()
+
+function(generateOsqueryUtilsSystemProfiler)
+  list(APPEND source_files
+    darwin/system_profiler.mm
+  )
+
+  add_osquery_library(osquery_utils_system_profiler ${source_files})
+
+  target_link_libraries(osquery_utils_system_profiler PRIVATE
+    osquery_cxx_settings
+    osquery_filesystem
+    thirdparty_boost
+  )
+
+  set(platform_public_header_files
+    darwin/system_profiler.h
+  )
+
+  generateIncludeNamespace(osquery_utils "osquery/utils" "FULL_PATH" ${platform_public_header_files})
 endfunction()
 
 function(generateOsqueryUtilsUtilstestsTest)
@@ -134,7 +169,12 @@ function(generateOsqueryUtilsUtilstestsTest)
       tests/windows/env.cpp
       tests/windows/filetime.cpp
       tests/windows/shellitems.cpp
-      tests/windows/shelllnk.cpp
+    )
+  endif()
+
+  if(DEFINED PLATFORM_DARWIN)
+    list(APPEND source_files
+      tests/darwin/system_profiler.mm
     )
   endif()
 

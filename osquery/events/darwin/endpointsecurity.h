@@ -42,8 +42,13 @@ struct EndpointSecurityEventContext : public EventContext {
   std::string event_type;
 
   pid_t pid;
+  int pidversion;
   pid_t parent;
+  int parent_pidversion;
   pid_t original_parent;
+  pid_t session_id;
+  pid_t responsible_pid;
+  int responsible_pidversion;
 
   std::string path;
   std::string cwd;
@@ -57,6 +62,7 @@ struct EndpointSecurityEventContext : public EventContext {
   std::string team_id;
   std::string cdhash;
   bool platform_binary;
+  std::string codesigning_flags;
 
   std::string executable;
   std::string username;
@@ -180,6 +186,8 @@ class EndpointSecurityFileEventPublisher
   bool es_file_client_success_{false};
   std::vector<std::string> muted_path_literals_;
   std::vector<std::string> muted_path_prefixes_;
+  std::vector<std::string> file_paths_;
+  std::vector<std::string> exclude_paths_;
   // clang-format off
   std::vector<std::string> default_muted_path_literals_ = {
       "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/WindowServer",
@@ -194,7 +202,7 @@ class EndpointSecurityFileEventPublisher
       "/usr/libexec/amfid",
       "/usr/libexec/watchdogd",
   };
-  // clang-format on 
+  // clang-format on
 };
 
 class ESProcessEventSubscriber

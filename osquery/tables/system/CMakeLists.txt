@@ -6,7 +6,6 @@
 # SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
 
 function(osqueryTablesSystemMain)
-
   if(OSQUERY_BUILD_TESTS)
     add_subdirectory("tests")
   endif()
@@ -66,6 +65,7 @@ function(generateOsqueryTablesSystemSystemtable)
       linux/intel_me.cpp
       linux/kernel_info.cpp
       linux/kernel_modules.cpp
+      linux/kernel_keys.cpp
       linux/md_tables.cpp
       linux/memory_info.cpp
       linux/memory_map.cpp
@@ -113,6 +113,8 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/battery.mm
       darwin/block_devices.cpp
       darwin/certificates.mm
+      darwin/connected_displays.mm
+      darwin/cpu_info.cpp
       darwin/cpu_time.cpp
       darwin/crashes.cpp
       darwin/cups_destinations.cpp
@@ -120,7 +122,7 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/disk_encryption.mm
       darwin/event_taps.mm
       darwin/extended_attributes.cpp
-      darwin/firewall.cpp
+      darwin/firewall.mm
       darwin/gatekeeper.cpp
       darwin/homebrew_packages.cpp
       darwin/ibridge.cpp
@@ -139,7 +141,7 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/mounts.cpp
       darwin/nfs_shares.cpp
       darwin/nvram.cpp
-      darwin/os_version.cpp
+      darwin/os_version.mm
       darwin/packages.mm
       darwin/password_policy.cpp
       darwin/pci_devices.cpp
@@ -150,6 +152,7 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/running_apps.mm
       darwin/sandboxes.cpp
       darwin/screenlock.mm
+      darwin/secureboot.mm
       darwin/shared_folders.mm
       darwin/sharing_preferences.cpp
       darwin/signature.mm
@@ -168,27 +171,13 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/xprotect.cpp
     )
 
-  elseif(DEFINED PLATFORM_FREEBSD)
-    list(APPEND source_files
-      freebsd/fbsd_kmods.cpp
-      freebsd/groups.cpp
-      freebsd/mounts.cpp
-      freebsd/os_version.cpp
-      freebsd/pkg_packages.cpp
-      freebsd/process_open_files.cpp
-      freebsd/processes.cpp
-      freebsd/procstat.cpp
-      freebsd/sysctl_utils.cpp
-      freebsd/users.cpp
-      freenux/cpu_time.cpp
-    )
-
   elseif(DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
       windows/appcompat_shims.cpp
       windows/authenticode.cpp
       windows/autoexec.cpp
       windows/background_activities_moderator.cpp
+      windows/battery.cpp
       windows/bitlocker_info.cpp
       windows/certificates.cpp
       windows/chassis_info.cpp
@@ -218,6 +207,8 @@ function(generateOsqueryTablesSystemSystemtable)
       windows/registry.cpp
       windows/scheduled_tasks.cpp
       windows/secureboot.cpp
+      windows/security_profile_info_utils.cpp
+      windows/security_profile_info.cpp
       windows/services.cpp
       windows/shared_resources.cpp
       windows/shellbags.cpp
@@ -232,6 +223,7 @@ function(generateOsqueryTablesSystemSystemtable)
       windows/windows_crashes.cpp
       windows/windows_eventlog.cpp
       windows/windows_optional_features.cpp
+      windows/windows_search.cpp
       windows/windows_security_products.cpp
       windows/windows_security_center.cpp
       windows/windows_update_history.cpp
@@ -240,7 +232,7 @@ function(generateOsqueryTablesSystemSystemtable)
       windows/wmi_event_filters.cpp
       windows/wmi_filter_consumer_binding.cpp
       windows/wmi_script_event_consumers.cpp
-      windows/hvci_status.cpp
+      windows/deviceguard_status.cpp
       windows/tpm_info.cpp
       windows/prefetch.cpp
     )
@@ -275,7 +267,6 @@ function(generateOsqueryTablesSystemSystemtable)
     target_link_libraries(osquery_tables_system_systemtable PUBLIC
       thirdparty_augeas
       thirdparty_libmagic
-      thirdparty_libxml2
     )
   else()
     target_link_libraries(osquery_tables_system_systemtable PRIVATE
@@ -286,10 +277,10 @@ function(generateOsqueryTablesSystemSystemtable)
   if(DEFINED PLATFORM_LINUX)
     target_link_libraries(osquery_tables_system_systemtable PUBLIC
       osquery_utils_linux
+      osquery_utils_system_boottime
       thirdparty_libdevmapper
       thirdparty_libcryptsetup
       thirdparty_librpm
-      thirdparty_popt
       thirdparty_dbus
       thirdparty_libcap
     )
@@ -302,6 +293,8 @@ function(generateOsqueryTablesSystemSystemtable)
 
   elseif(DEFINED PLATFORM_MACOS)
     target_link_libraries(osquery_tables_system_systemtable PUBLIC
+      osquery_utils_plist
+      osquery_utils_system_profiler
       thirdparty_openssl
     )
 
@@ -346,6 +339,7 @@ function(generateOsqueryTablesSystemSystemtable)
       linux/apt_sources.h
       linux/md_tables.h
       linux/pci_devices.h
+      linux/processes.h
       linux/smbios_utils.h
     )
 
@@ -358,17 +352,13 @@ function(generateOsqueryTablesSystemSystemtable)
       darwin/smbios_utils.h
     )
 
-  elseif(DEFINED PLATFORM_FREEBSD)
-    list(APPEND platform_public_header_files
-      freebsd/procstat.h
-    )
-
   elseif(DEFINED PLATFORM_WINDOWS)
     list(APPEND platform_public_header_files
       windows/registry.h
       windows/certificates.h
       windows/windows_eventlog.h
       windows/windows_update_history.h
+      windows/security_profile_info_utils.h
     )
   endif()
 
@@ -391,6 +381,7 @@ function(generateOsqueryTablesSystemSystemtable)
       PROPERTIES ENVIRONMENT "TEST_CONF_FILES_DIR=${TEST_CONFIGS_DIR}"
     )
   elseif(DEFINED PLATFORM_MACOS)
+    add_test(NAME osquery_tables_system_darwin_keychain_tests-test COMMAND osquery_tables_system_darwin_keychain_tests-test)
     add_test(NAME osquery_tables_system_darwin_tests-test COMMAND osquery_tables_system_darwin_tests-test)
 
     set_tests_properties(

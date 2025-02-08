@@ -9,6 +9,8 @@
 
 #include <iomanip>
 #include <sstream>
+#include <string>
+#include <unordered_map>
 
 #include <sys/sysctl.h>
 #include <sys/types.h>
@@ -18,12 +20,16 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/optional.hpp>
 
 #include <osquery/core/tables.h>
+#include <osquery/logger/logger.h>
+#include <osquery/tables/system/darwin/smbios_utils.h>
 #include <osquery/tables/system/smbios_utils.h>
 #include <osquery/utils/conversions/darwin/cfstring.h>
 #include <osquery/utils/conversions/darwin/iokit.h>
 #include <osquery/utils/conversions/join.h>
+#include <osquery/utils/info/firmware.h>
 
 namespace osquery {
 namespace tables {
@@ -32,24 +38,51 @@ namespace tables {
 #define kIOSMBIOSPropertyName_ "SMBIOS"
 #define kIOSMBIOSEPSPropertyName_ "SMBIOS-EPS"
 
-class DarwinSMBIOSParser : public SMBIOSParser {
- public:
-  void setData(uint8_t* tables, size_t length) {
-    table_data_ = tables;
-    table_size_ = length;
+#include <IOKit/IOKitLib.h>
+
+enum class FirmwareType {
+  EFI,
+  iBoot,
+  OpenFirmware,
+};
+
+bool getFirmwareType(FirmwareType& firmware_type) {
+  // clang-format off
+  static const std::unordered_map<FirmwareType, std::string> kFirmwareToRegistryPath{
+    { FirmwareType::EFI, kIODeviceTreePlane ":/efi" },
+    { FirmwareType::iBoot, kIODeviceTreePlane ":/chosen/iBoot" },
+    { FirmwareType::OpenFirmware, kIODeviceTreePlane ":/openprom" },
+  };
+  // clang-format on
+
+  mach_port_t master_port{};
+  if (IOMasterPort(MACH_PORT_NULL, &master_port) != 0) {
+    return false;
   }
 
-  bool discover();
+  boost::optional<FirmwareType> opt_detected_firmware_type;
 
-  ~DarwinSMBIOSParser() {
-    if (smbios_data_ != nullptr) {
-      free(smbios_data_);
+  for (const auto& p : kFirmwareToRegistryPath) {
+    const auto& firmware_type = p.first;
+    const auto& registry_path = p.second;
+
+    auto registry_entry =
+        IORegistryEntryFromPath(master_port, registry_path.c_str());
+
+    if (registry_entry != MACH_PORT_NULL) {
+      IOObjectRelease(registry_entry);
+
+      opt_detected_firmware_type = firmware_type;
+      break;
     }
   }
 
- private:
-  uint8_t* smbios_data_{nullptr};
-};
+  if (opt_detected_firmware_type.has_value()) {
+    firmware_type = opt_detected_firmware_type.value();
+  }
+
+  return opt_detected_firmware_type.has_value();
+}
 
 bool DarwinSMBIOSParser::discover() {
   auto matching = IOServiceMatching(kIOSMBIOSClassName_);
@@ -278,6 +311,16 @@ QueryData genIntelPlatformInfo(QueryContext& context) {
   r["date"] = getIOKitProperty(details, "release-date");
   r["version"] = getIOKitProperty(details, "version");
 
+  auto opt_firmware_kind = getFirmwareKind();
+  if (opt_firmware_kind.has_value()) {
+    const auto& firmware_kind = opt_firmware_kind.value();
+    r["firmware_type"] = getFirmwareKindDescription(firmware_kind);
+
+  } else {
+    LOG(ERROR) << "platform_info: Failed to determine the firmware type";
+    r["firmware_type"] = SQL_TEXT("unknown");
+  }
+
   {
     auto address = getIOKitProperty(details, "fv-main-address");
     if (!address.empty()) {
@@ -317,32 +360,50 @@ QueryData genIntelPlatformInfo(QueryContext& context) {
 QueryData genAarch64PlatformInfo(QueryContext& context) {
   auto device_tree =
       IORegistryEntryFromPath(kIOMasterPortDefault, "IODeviceTree:/");
-  if (device_tree == 0) {
+  if (device_tree == MACH_PORT_NULL) {
     return {};
   }
 
-  CFMutableDictionaryRef details = nullptr;
+  CFMutableDictionaryRef device_tree_details = nullptr;
   IORegistryEntryCreateCFProperties(
-      device_tree, &details, kCFAllocatorDefault, kNilOptions);
+      device_tree, &device_tree_details, kCFAllocatorDefault, kNilOptions);
   IOObjectRelease(device_tree);
 
-  if (details == nullptr) {
+  if (device_tree_details == nullptr) {
     return {};
   }
+
   Row r;
-  r["vendor"] = getIOKitProperty(details, "manufacturer");
+  r["vendor"] = getIOKitProperty(device_tree_details, "manufacturer");
+  CFRelease(device_tree_details);
+
+  auto opt_firmware_kind = getFirmwareKind();
+  if (opt_firmware_kind.has_value()) {
+    const auto& firmware_kind = opt_firmware_kind.value();
+    r["firmware_type"] = getFirmwareKindDescription(firmware_kind);
+
+  } else {
+    LOG(ERROR) << "platform_info: Failed to determine the firmware type";
+    r["firmware_type"] = SQL_TEXT("unknown");
+  }
 
   auto chosen =
       IORegistryEntryFromPath(kIOMasterPortDefault, "IODeviceTree:/chosen");
-  if (chosen != 0) {
+  if (chosen != MACH_PORT_NULL) {
+    CFMutableDictionaryRef chosen_details = nullptr;
     IORegistryEntryCreateCFProperties(
-        chosen, &details, kCFAllocatorDefault, kNilOptions);
+        chosen, &chosen_details, kCFAllocatorDefault, kNilOptions);
     IOObjectRelease(chosen);
-    r["version"] = getIOKitProperty(details, "system-firmware-version");
+
+    if (chosen_details != nullptr) {
+      r["version"] =
+          getIOKitProperty(chosen_details, "system-firmware-version");
+      CFRelease(chosen_details);
+    }
   }
 
   auto root = IORegistryGetRootEntry(kIOMasterPortDefault);
-  if (root != 0) {
+  if (root != MACH_PORT_NULL) {
     CFTypeRef property = (CFDataRef)IORegistryEntryCreateCFProperty(
         root, CFSTR(kIOKitBuildVersionKey), kCFAllocatorDefault, 0);
     if (property != nullptr) {
@@ -359,7 +420,6 @@ QueryData genAarch64PlatformInfo(QueryContext& context) {
   r["revision"] = "";
   r["address"] = "";
 
-  CFRelease(details);
   return {r};
 }
 

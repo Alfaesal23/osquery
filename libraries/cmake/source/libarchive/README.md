@@ -24,21 +24,17 @@ Append the following to the CMake options:
 
 ```sh
 cmake \
-  -S src \
+  -S . \
   -B b \
   -DBUILD_TESTING=OFF \
   -DBUILD_SHARED_LIBS=OFF \
   -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_BZip2=ON \
-  -DUSE_BZIP2_STATIC=ON \
-  -DENABLE_LIBXML2=ON \
-  -DLIBXML_STATIC=ON \
-  -DENABLE_LZMA=ON \
-  -DHAVE_LZMA_STREAM_ENCODER_MT=ON \
-  -DENABLE_OPENSSL=ON \
-  -DENABLE_ZLIB=ON \
-  -DENABLE_ZSTD=ON \
-  -DHAVE_LIBZSTD=ON \
+  -DENABLE_BZip2=OFF \
+  -DENABLE_LIBXML2=OFF \
+  -DENABLE_LZMA=OFF \
+  -DENABLE_OPENSSL=OFF \
+  -DENABLE_ZLIB=OFF \
+  -DENABLE_ZSTD=OFF \
   -DENABLE_ACL=OFF \
   -DENABLE_CAT=OFF \
   -DENABLE_CAT_SHARED=OFF \
@@ -52,7 +48,7 @@ cmake \
   -DENABLE_LIBB2=OFF \
   -DENABLE_LZ4=OFF \
   -DENABLE_LZO=OFF \
-  -DENABLE_LibGCC=OFF \
+  -DENABLE_LIBGCC=OFF \
   -DENABLE_MBEDTLS=OFF \
   -DENABLE_NETTLE=OFF \
   -DENABLE_PCREPOSIX=OFF \
@@ -64,25 +60,21 @@ cmake \
   -DENABLE_XATTR=OFF
 ```
 
-## Windows
+## Windows (x86-64, ARM64)
 
 ```cmd
 cmake ^
-  -S src ^
+  -S . ^
   -B b ^
   -DBUILD_TESTING=OFF ^
   -DBUILD_SHARED_LIBS=OFF ^
   -DCMAKE_BUILD_TYPE=Release ^
-  -DENABLE_BZip2=ON ^
-  -DUSE_BZIP2_STATIC=ON ^
-  -DENABLE_LIBXML2=ON ^
-  -DLIBXML_STATIC=ON ^
-  -DENABLE_LZMA=ON ^
-  -DHAVE_LZMA_STREAM_ENCODER_MT=ON ^
-  -DENABLE_OPENSSL=ON ^
-  -DENABLE_ZLIB=ON ^
-  -DENABLE_ZSTD=ON ^
-  -DHAVE_LIBZSTD=ON ^
+  -DENABLE_BZip2=OFF ^
+  -DENABLE_LIBXML2=OFF ^
+  -DENABLE_LZMA=OFF ^
+  -DENABLE_OPENSSL=OFF ^
+  -DENABLE_ZLIB=OFF ^
+  -DENABLE_ZSTD=OFF ^
   -DENABLE_ACL=OFF ^
   -DENABLE_CAT=OFF ^
   -DENABLE_CAT_SHARED=OFF ^
@@ -96,7 +88,7 @@ cmake ^
   -DENABLE_LIBB2=OFF ^
   -DENABLE_LZ4=OFF ^
   -DENABLE_LZO=OFF ^
-  -DENABLE_LibGCC=OFF ^
+  -DENABLE_LIBGCC=OFF ^
   -DENABLE_MBEDTLS=OFF ^
   -DENABLE_NETTLE=OFF ^
   -DENABLE_PCREPOSIX=OFF ^
@@ -105,16 +97,14 @@ cmake ^
   -DENABLE_TAR_SHARED=OFF ^
   -DENABLE_TEST=OFF ^
   -DENABLE_WERROR=OFF ^
-  -DENABLE_XATTR=OFF
+  -DENABLE_XATTR=OFF ^
+  -DWINDOWS_VERSION=WIN7 ^
+  -DPOSIX_REGEX_LIB=NONE
 ```
 
-## All Platforms
+NOTE: If necessary, convert the config.h line endings from CRLF to LF.
+The `POSIX_REGEX_LIB=NONE` is a hack, since it tries to find a library only if it's set to some other hardcoded values. For our use the regex library is currently not necessary, because it's only used by a CLI shipped with the libarchive project. Not doing so gives an error during configure time: `libgcc not found.`
 
-Make sure the following config options are enabled:
+## Common
 
-- `HAVE_LIBLZMA`
-- `HAVE_LZMA_H`
-- `HAVE_LZMA_STREAM_ENCODER_MT`
-- `HAVE_BZLIB_H`
-- `HAVE_LIBBZ2`
-- `HAVE_LIBXML2`
+After configuration, copy the config.h from the `b` folder.

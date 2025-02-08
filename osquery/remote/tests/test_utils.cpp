@@ -18,14 +18,15 @@
 #include <osquery/database/database.h>
 #include <osquery/logger/logger.h>
 #include <osquery/process/process.h>
+#include <osquery/remote/requests.h>
+#include <osquery/remote/serializers/json.h>
 #include <osquery/remote/tests/test_utils.h>
+#include <osquery/remote/transports/tls.h>
 #include <osquery/sql/sql.h>
 #include <osquery/tests/test_util.h>
 #include <osquery/utils/conversions/join.h>
 #include <osquery/utils/json/json.h>
 #include <osquery/utils/system/time.h>
-
-namespace fs = boost::filesystem;
 
 namespace osquery {
 
@@ -36,7 +37,8 @@ DECLARE_string(enroll_secret_path);
 DECLARE_bool(disable_caching);
 
 Status TLSServerRunner::startAndSetScript(const std::string& port,
-                                          const std::string& server_cert) {
+                                          const std::string& server_cert,
+                                          bool verify_client_cert) {
   auto script = (getTestHelperScriptsDirectory() / "test_http_server.py");
   auto config_dir = getTestConfigDirectory();
   std::vector<std::string> args = {
@@ -50,6 +52,10 @@ Status TLSServerRunner::startAndSetScript(const std::string& port,
   if (!server_cert.empty()) {
     args.push_back("--cert");
     args.push_back(server_cert);
+  }
+
+  if (verify_client_cert) {
+    args.push_back("--verify-client-cert");
   }
 
   args.push_back(port);
@@ -82,7 +88,8 @@ Status TLSServerRunner::getListeningPortPid(const std::string& port,
   return Status::success();
 }
 
-bool TLSServerRunner::start(const std::string& server_cert) {
+bool TLSServerRunner::start(const std::string& server_cert,
+                            bool verify_client_cert) {
   auto& self = instance();
   if (self.server_ != nullptr) {
     return true;
@@ -107,7 +114,8 @@ bool TLSServerRunner::start(const std::string& server_cert) {
       }
     }
 
-    auto status = self.startAndSetScript(self.port_, server_cert);
+    auto status =
+        self.startAndSetScript(self.port_, server_cert, verify_client_cert);
     if (!status.ok()) {
       // This is an unexpected problem, retry without waiting.
       LOG(WARNING) << status.getMessage();
@@ -148,6 +156,72 @@ bool TLSServerRunner::start(const std::string& server_cert) {
   if (!started) {
     return false;
   }
+
+  LOG(WARNING) << "Python server process started correctly";
+
+  // Verify that the server is also actually ready to serve
+  retry = 0;
+  bool ready_to_serve = false;
+
+  /* Temporarily configure the test certificates,
+     so that the client doesn't immediately fails
+     for not finding certificate files */
+  std::string client_cert = Flag::getValue("tls_client_cert");
+  Flag::updateValue(
+      "tls_client_cert",
+      (getTestConfigDirectory() / "test_client.pem").make_preferred().string());
+
+  std::string client_key = Flag::getValue("tls_client_key");
+  Flag::updateValue(
+      "tls_client_key",
+      (getTestConfigDirectory() / "test_client.key").make_preferred().string());
+
+  std::string server_ca_certs = Flag::getValue("tls_server_certs");
+  Flag::updateValue("tls_server_certs",
+                    (getTestConfigDirectory() / "test_server_ca.pem")
+                        .make_preferred()
+                        .string());
+
+  while (retry < max_retry) {
+    std::string ping_server_uri =
+        "https://localhost:" + std::string(self.port_);
+
+    Request<TLSTransport, JSONSerializer> request(ping_server_uri);
+    Status status = request.call();
+
+    /* The provided client settings won't always make us succeed
+       in establishing a correct TLS connection,
+       but we assume that if it's not a timeout,
+       then the server is ready enough. */
+    if (!status.ok()) {
+      if (status.getMessage().find("Operation timed out") !=
+          std::string::npos) {
+        LOG(WARNING) << "Python HTTP Server not ready yet";
+        sleepFor(5000);
+        ++retry;
+        continue;
+      } else {
+        /* We still log this failure to see what was the issue,
+           but in theory the server is ready to serve. */
+        LOG(WARNING) << "Failed to ping: " << status.getMessage();
+      }
+    }
+
+    ready_to_serve = true;
+    break;
+  }
+
+  Flag::updateValue("tls_client_cert", client_cert);
+  Flag::updateValue("tls_client_key", client_key);
+  Flag::updateValue("tls_server_certs", server_ca_certs);
+
+  if (!ready_to_serve) {
+    LOG(ERROR) << "The Python server was not ready to serve in time";
+    return false;
+  }
+
+  LOG(WARNING) << "Server is now ready to serve";
+
   return true;
 }
 
@@ -171,6 +245,14 @@ void TLSServerRunner::setClientConfig() {
                     (getTestConfigDirectory() / "test_enroll_secret.txt")
                         .make_preferred()
                         .string());
+
+  Flag::updateValue(
+      "tls_client_cert",
+      (getTestConfigDirectory() / "test_client.pem").make_preferred().string());
+
+  Flag::updateValue(
+      "tls_client_key",
+      (getTestConfigDirectory() / "test_client.key").make_preferred().string());
 }
 
 void TLSServerRunner::unsetClientConfig() {

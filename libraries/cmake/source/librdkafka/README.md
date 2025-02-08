@@ -23,7 +23,7 @@ Integrate the osquery-toolchain in the main `CMakeLists.txt` file (see the follo
 cmake \
   -S . \
   -B build \
-  -DOSQUERY_TOOLCHAIN_SYSROOT=/opt/osquery-toolchain \
+  -DOSQUERY_TOOLCHAIN_SYSROOT=/usr/local/osquery-toolchain \
   -DBUILD_SHARED_LIBS=OFF \
   -DENABLE_DEVEL=OFF \
   -DENABLE_LZ4_EXT=OFF \
@@ -119,7 +119,7 @@ cmake \
   -DOPENSSL_ROOT_DIR=/usr/local/Cellar/openssl@1.1/1.1.1k
 ```
 
-## Windows
+## Windows (x86-64, ARM64)
 
 ```cmd
 cmake ^

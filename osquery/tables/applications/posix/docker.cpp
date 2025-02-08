@@ -15,9 +15,9 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/split.hpp>
-#include <boost/property_tree/json_parser.hpp>
 #include <boost/asio.hpp>
 #include <boost/foreach.hpp>
+#include <boost/property_tree/json_parser.hpp>
 
 #if !defined(BOOST_ASIO_HAS_LOCAL_SOCKETS)
 #error Boost error: Local sockets not available
@@ -409,8 +409,13 @@ QueryData genContainers(QueryContext& context) {
           BIGINT(container_details.get_child("State").get<pid_t>("Pid", -1));
       r["started_at"] = container_details.get_child("State").get<std::string>(
           "StartedAt", "");
-      r["finished_at"] = container_details.get_child("State").get<std::string>(
-          "FinishedAt", "");
+      if (r["state"] != "running") {
+        r["finished_at"] =
+            container_details.get_child("State").get<std::string>("FinishedAt",
+                                                                  "");
+      } else {
+        r["finished_at"] = "";
+      }
       r["privileged"] = container_details.get_child("HostConfig")
                                 .get<bool>("Privileged", false)
                             ? INTEGER(1)
@@ -634,7 +639,6 @@ QueryData genContainerPorts(QueryContext& context) {
  */
 QueryData genContainerProcesses(QueryContext& context) {
   QueryData results;
-  std::string ps_args;
 
   for (const auto& id : context.constraints["id"].getAll(EQUALS)) {
     if (!checkConstraintValue(id)) {
@@ -642,23 +646,9 @@ QueryData genContainerProcesses(QueryContext& context) {
     }
 
     pt::ptree container;
-
-    if (isPlatform(PlatformType::TYPE_OSX)) {
-      // osx: 19 fields
-      // currently OS X Docker API will only return
-      // "PID","USER","TIME","COMMAND" fields
-      ps_args =
-          "pid,state,uid,gid,svuid,svgid,rss,vsz,etime,ppid,pgid,wq,nice,user,"
-          "time,pcpu,pmem,comm,command";
-    } else if (isPlatform(PlatformType::TYPE_LINUX)) {
-      // linux: 21 fields
-      ps_args =
-          "pid,state,uid,gid,euid,egid,suid,sgid,rss,vsz,etime,ppid,pgrp,nlwp,"
-          "nice,user,time,pcpu,pmem,comm,cmd";
-    } else {
-      continue;
-    }
-
+    std::string ps_args =
+        "pid,state,uid,gid,euid,egid,suid,sgid,rss,vsz,etime,ppid,pgrp,nlwp,"
+        "nice,user,time,pcpu,pmem,comm,cmd";
     auto s = dockerApi("/containers/" + id + "/top?ps_args=axwwo%20" + ps_args,
                        container);
 
@@ -676,14 +666,8 @@ QueryData genContainerProcesses(QueryContext& context) {
 
         Row r;
         r["id"] = id;
-        r["pid"] = BIGINT(vector.at(0));
-        r["wired_size"] = BIGINT(0); // No support for unpagable counters
-        if (isPlatform(PlatformType::TYPE_OSX) && vector.size() == 4) {
-          r["uid"] = BIGINT(vector.at(1));
-          r["time"] = vector.at(2);
-          r["cmdline"] = vector.at(3);
-        } else if (isPlatform(PlatformType::TYPE_LINUX) &&
-                   vector.size() == 21) {
+        if (vector.size() == 21) {
+          r["pid"] = BIGINT(vector.at(0));
           r["state"] = vector.at(1);
           r["uid"] = BIGINT(vector.at(2));
           r["gid"] = BIGINT(vector.at(3));
@@ -705,6 +689,8 @@ QueryData genContainerProcesses(QueryContext& context) {
           r["name"] = vector.at(19);
           r["cmdline"] = vector.at(20);
         } else {
+          VLOG(1) << "Error getting docker container processes " << id << ": "
+                  << "unexpected row length (expected 21): " << vector.size();
           continue;
         }
 
@@ -861,12 +847,11 @@ std::string getIOBytes(const pt::ptree& tree, const std::string& op) {
  * @return Cumulative value for "key".
  */
 std::string getNetworkBytes(const pt::ptree& tree, const std::string& key) {
-  uint64_t value = 0;
-  for (const auto& node : tree) {
-    value += node.second.get<uint64_t>(key, 0);
+  auto opt = tree.get_optional<std::string>(key);
+  if (opt) {
+    return *opt;
   }
-
-  return BIGINT(value);
+  return "0";
 }
 
 /**
@@ -930,14 +915,19 @@ QueryData genContainerStats(QueryContext& context) {
           INTEGER(container.get<uint64_t>("precpu_stats.online_cpus", 0));
       r["memory_usage"] =
           BIGINT(container.get<uint64_t>("memory_stats.usage", 0));
+      r["memory_cached"] =
+          BIGINT(container.get<uint64_t>("memory_stats.stats.cache", 0));
       r["memory_max_usage"] =
           BIGINT(container.get<uint64_t>("memory_stats.max_usage", 0));
       r["memory_limit"] =
           BIGINT(container.get<uint64_t>("memory_stats.limit", 0));
-      r["network_rx_bytes"] = getNetworkBytes(
-          container.get_child("networks", pt::ptree()), "rx_bytes");
-      r["network_tx_bytes"] = getNetworkBytes(
-          container.get_child("networks", pt::ptree()), "tx_bytes");
+      if (auto networks = container.get_child_optional("networks")) {
+        r["network_rx_bytes"] = getNetworkBytes(*networks, "rx_bytes");
+        r["network_tx_bytes"] = getNetworkBytes(*networks, "tx_bytes");
+      } else {
+        r["network_rx_bytes"] = "0";
+        r["network_tx_bytes"] = "0";
+      }
       results.push_back(r);
     } catch (const pt::ptree_error& e) {
       VLOG(1) << "Error getting docker container stats " << id << ": "
