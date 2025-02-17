@@ -1,7 +1,7 @@
 table_name("process_open_sockets")
 description("Processes which have open network sockets on the system.")
 schema([
-    Column("pid", INTEGER, "Process (or thread) ID", index=True),
+    Column("pid", INTEGER, "Process (or thread) ID", additional=True),
     Column("fd", BIGINT, "Socket file descriptor number"),
     Column("socket", BIGINT, "Socket handle or inode number"),
     Column("family", INTEGER, "Network protocol (IPv4, IPv6)"),
@@ -11,8 +11,6 @@ schema([
     Column("local_port", INTEGER, "Socket local port"),
     Column("remote_port", INTEGER, "Socket remote port"),
     Column("path", TEXT, "For UNIX sockets (family=AF_UNIX), the domain path"),
-])
-extended_schema(lambda: LINUX() or DARWIN() or WINDOWS(), [
     Column("state", TEXT, "TCP socket state"),
 ])
 extended_schema(LINUX, [

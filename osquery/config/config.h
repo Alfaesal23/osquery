@@ -90,11 +90,11 @@ class Config : private boost::noncopyable {
    * @param r0 the process row before the query
    * @param r1 the process row after the query
    */
-  void recordQueryPerformance(const std::string& name,
-                              uint64_t delay_ms,
-                              uint64_t size,
-                              const Row& r0,
-                              const Row& r1);
+  static void recordQueryPerformance(const std::string& name,
+                                     uint64_t delay_ms,
+                                     uint64_t size,
+                                     const Row& r0,
+                                     const Row& r1);
 
   /**
    * @brief Record a query 'initialization', meaning the query will run.
@@ -215,16 +215,16 @@ class Config : private boost::noncopyable {
    * QueryPerformance struct, if it exists.
    *
    * @code{.cpp}
-   *   Config::get().getPerformanceStats(
+   *   Config::getPerformanceStats(
    *     "my_awesome_query",
    *     [](const QueryPerformance& query) {
    *       // use "query" here
    *     });
    * @endcode
    */
-  void getPerformanceStats(
+  static void getPerformanceStats(
       const std::string& name,
-      std::function<void(const QueryPerformance& query)> predicate) const;
+      std::function<void(const QueryPerformance& query)> predicate);
 
   /**
    * @brief Helper to access config parsers via the registry
@@ -331,9 +331,6 @@ class Config : private boost::noncopyable {
   /// Schedule of packs and their queries.
   std::unique_ptr<Schedule> schedule_;
 
-  /// A set of performance stats for each query in the schedule.
-  std::map<std::string, QueryPerformance> performance_;
-
   /// A set of named categories filled with filesystem globbing paths.
   using FileCategories = std::map<std::string, std::vector<std::string>>;
   std::map<std::string, FileCategories> files_;
@@ -376,6 +373,7 @@ class Config : private boost::noncopyable {
   FRIEND_TEST(ConfigTests, test_get_scheduled_queries);
   FRIEND_TEST(ConfigTests, test_nondenylist_query);
   FRIEND_TEST(ConfigTests, test_config_cli_flags);
+  FRIEND_TEST(ConfigTests, test_pack_stats);
   FRIEND_TEST(OptionsConfigParserPluginTests, test_get_option);
   FRIEND_TEST(OptionsConfigParserPluginTests, test_get_option_first);
   FRIEND_TEST(ViewsConfigParserPluginTests, test_add_view);
@@ -391,6 +389,7 @@ class Config : private boost::noncopyable {
   FRIEND_TEST(EventsTests, test_event_subscriber_configure);
   FRIEND_TEST(TLSConfigTests, test_retrieve_config);
   FRIEND_TEST(TLSConfigTests, test_runner_and_scheduler);
+  FRIEND_TEST(BufferedLogForwarderTests, test_status_log_custom_decorations);
 };
 
 /**

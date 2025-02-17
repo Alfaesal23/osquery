@@ -13,6 +13,7 @@
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
 #include <osquery/utils/conversions/windows/strings.h>
+#include <osquery/utils/info/firmware.h>
 
 #include "osquery/core/windows/wmi.h"
 
@@ -142,6 +143,16 @@ QueryData genPlatformInfo(QueryContext& context) {
 
   auto s = to_iso8601_date(release_date);
   r["date"] = s.empty() ? "-1" : s;
+
+  auto opt_firmware_kind = getFirmwareKind();
+  if (opt_firmware_kind.has_value()) {
+    const auto& firmware_kind = opt_firmware_kind.value();
+    r["firmware_type"] = getFirmwareKindDescription(firmware_kind);
+
+  } else {
+    LOG(ERROR) << "platform_info: Failed to determine the firmware type";
+    r["firmware_type"] = "unknown";
+  }
 
   results.push_back(r);
   return results;

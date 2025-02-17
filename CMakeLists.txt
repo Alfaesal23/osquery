@@ -86,7 +86,10 @@ endfunction()
 
 function(importLibraries)
   set(library_descriptor_list
+    # Leave lz4 at the top (see LZ4 CMakeLists.txt)
+    "Linux,Darwin,Windows:lz4"
     "Linux,Darwin:augeas"
+    "Linux,Darwin,Windows:openssl"
     "Linux,Darwin,Windows:boost"
     "Linux,Darwin,Windows:bzip2"
     "Linux,Darwin,Windows:gflags"
@@ -103,10 +106,9 @@ function(importLibraries)
     "Linux,Darwin,Windows:librdkafka"
     "Linux:librpm"
     "Linux:libudev"
-    "Linux,Darwin,Windows:libxml2"
     "Linux,Darwin,Windows:linenoise-ng"
     "Linux,Darwin,Windows:lzma"
-    "Linux,Darwin:popt"
+    "Linux:popt"
     "Linux,Darwin,Windows:rapidjson"
     "Linux,Darwin,Windows:rocksdb"
     "Linux,Darwin,Windows:sleuthkit"
@@ -116,7 +118,6 @@ function(importLibraries)
     "Linux,Darwin,Windows:yara"
     "Linux,Darwin,Windows:zlib"
     "Linux,Darwin,Windows:zstd"
-    "Linux,Darwin,Windows:openssl"
     "Linux:expat"
     "Linux:dbus"
     "Linux:libcap"
@@ -139,6 +140,12 @@ function(importLibraries)
       "Linux:libdpkg"
     )
   endif()
+  
+  if(OSQUERY_BUILD_ETW)
+    list(APPEND library_descriptor_list
+      "Windows:krabsetw"
+    )
+  endif()  
 
   # Create a target that builds all the third party libraries for convenience
   add_custom_target(thirdparty_libraries)

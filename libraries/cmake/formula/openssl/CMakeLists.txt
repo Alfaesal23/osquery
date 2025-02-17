@@ -1,7 +1,7 @@
 project(thirdparty_openssl)
 
-set(OPENSSL_VERSION "1.1.1q")
-set(OPENSSL_ARCHIVE_SHA256 "d7939ce614029cdff0b6c20f0e2e5703158a489a72b2507b8bd51bf8c8fd10ca")
+set(OPENSSL_VERSION "3.2.1")
+set(OPENSSL_ARCHIVE_SHA256 "83c7329fe52c850677d75e5d0b0ca245309b97e8ecbcfdc1dfdc4ab9fac35b39")
 
 set(OSQUERY_OPENSSL_ARCHIVE_PATH "" CACHE FILEPATH "Optional path to an openssl archive to use instead of downloading it")
 
@@ -10,7 +10,6 @@ include(ExternalProject)
 function(opensslMain)
 
   set(common_options
-    no-ssl2
     no-ssl3
     no-asm
     no-shared
@@ -54,16 +53,22 @@ function(opensslMain)
       ${make_command} install_sw install_ssldirs
     )
 
+    if(TARGET_PROCESSOR STREQUAL "aarch64")
+      set(lib_folder_name "lib")
+    else()
+      set(lib_folder_name "lib64")
+    endif()
+
     set(openssl_libs
-      "${install_prefix}/lib/libssl.a"
-      "${install_prefix}/lib/libcrypto.a"
+      "${install_prefix}/${lib_folder_name}/libssl.a"
+      "${install_prefix}/${lib_folder_name}/libcrypto.a"
     )
 
     set_target_properties(thirdparty_openssl_ssl PROPERTIES IMPORTED_LOCATION
-      "${install_prefix}/lib/libssl.a"
+      "${install_prefix}/${lib_folder_name}/libssl.a"
     )
     set_target_properties(thirdparty_openssl_crypto PROPERTIES IMPORTED_LOCATION
-      "${install_prefix}/lib/libcrypto.a"
+      "${install_prefix}/${lib_folder_name}/libcrypto.a"
     )
 
   elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
@@ -132,9 +137,15 @@ function(opensslMain)
     set(CMAKE_PREFIX_PATH "C:\\Strawberry\\perl\\bin")
     find_package(Perl REQUIRED)
 
+    if("${TARGET_PROCESSOR}" STREQUAL "aarch64")
+      set(OPENSSL_ARCH VC-WIN64-ARM)
+    else()
+      set(OPENSSL_ARCH VC-WIN64A)
+    endif()
+
     set(configure_command
       "${CMAKE_COMMAND}" -E env
-      "${PERL_EXECUTABLE}" Configure VC-WIN64A
+      "${PERL_EXECUTABLE}" Configure ${OPENSSL_ARCH}
       ${common_options}
     )
 
@@ -176,12 +187,9 @@ function(opensslMain)
   list(APPEND openssl_c_flags ${OSQUERY_FORMULA_CFLAGS})
   string(REPLACE ";" " " openssl_c_flags "${openssl_c_flags}")
 
-  string(REGEX MATCH "[0-9]\.[0-9]\.[0-9]" OPENSSL_VERSION_NO_PATCH "${OPENSSL_VERSION}")
-
   if("${OSQUERY_OPENSSL_ARCHIVE_PATH}" STREQUAL "")
     set(openssl_urls
-      "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
-      "https://www.openssl.org/source/old/${OPENSSL_VERSION_NO_PATCH}/openssl-${OPENSSL_VERSION}.tar.gz"
+      "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
     )
   else()
     if(NOT EXISTS "${OSQUERY_OPENSSL_ARCHIVE_PATH}" OR IS_DIRECTORY "${OSQUERY_OPENSSL_ARCHIVE_PATH}")
@@ -219,6 +227,11 @@ function(opensslMain)
   target_link_libraries(thirdparty_openssl INTERFACE
     thirdparty_openssl_ssl
     thirdparty_openssl_crypto
+  )
+
+  # Set compatibility to openssl 1.1.1 APIs until all the libraries are updated to work with openssl 3.x
+  target_compile_definitions(thirdparty_openssl INTERFACE
+    OPENSSL_API_COMPAT=10101
   )
 endfunction()
 

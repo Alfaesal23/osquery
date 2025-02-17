@@ -13,7 +13,7 @@ cmake \
   -DBUILD_SHARED_LIBS=OFF \
   -DCMAKE_BUILD_TYPE=Release \
   -DNO_HTTP_CLIENT=ON \
-  -DOSQUERY_TOOLCHAIN_SYSROOT=/opt/osquery-toolchain
+  -DOSQUERY_TOOLCHAIN_SYSROOT=/usr/local/osquery-toolchain
 ```
 
 ## macOS
@@ -48,7 +48,7 @@ cmake \
   -DOPENSSL_ROOT_DIR=/usr/local/Cellar/openssl@1.1/1.1.1k
 ```
 
-## Windows
+## Windows (x86_64, ARM64)
 
 ```cmd
 cmake ^

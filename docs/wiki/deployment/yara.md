@@ -1,5 +1,7 @@
 # YARA-based scanning with osquery
 
+YARA is a tool that allows you to find textual or binary patterns inside of files.
+
 There are two YARA-related tables in osquery, which serve very different purposes. The first table, called
 `yara_events`, uses osquery's [Events framework](../development/pubsub-framework.md) to monitor for filesystem changes
 and will execute YARA when a file change event fires. The second table, just called `yara`, is a table for performing an
@@ -7,6 +9,8 @@ on-demand YARA scan.
 
 In this document, "signature file" is intended to be synonymous with "YARA rule file" (plain-text files commonly
 distributed with a `.yar` or `.yara` filename extension, although any extension is allowed).
+
+For more information about YARA, check out the [documentation](https://yara.readthedocs.io/en/stable/).
 
 ## YARA Configuration
 
@@ -19,23 +23,23 @@ filesystem:
   "yara": {
     "signatures": {
       // Each key is an arbitrary group name to give the signatures listed
-      "sig_group_1": [ "/Users/wxs/sigs/foo.yar", "/Users/wxs/sigs/bar.yar" ],
-      "sig_group_2": [ "/Users/wxs/sigs/baz.yar" ]
+      "sig_group_1": ["/Users/wxs/sigs/foo.yar", "/Users/wxs/sigs/bar.yar"],
+      "sig_group_2": ["/Users/wxs/sigs/baz.yar"]
     },
     "file_paths": {
       // Each key is a key from file_paths
       // The value is a list of signature groups to run when an event fires
       // These will be watched for and scanned when the event framework
       // fire off an event to yara_events table
-      "system_binaries": [ "sig_group_1" ],
-      "tmp": [ "sig_group_1", "sig_group_2" ]
+      "system_binaries": ["sig_group_1"],
+      "tmp": ["sig_group_1", "sig_group_2"]
     }
   },
 
   // Paths to watch for filesystem events
   "file_paths": {
-    "system_binaries": [ "/usr/bin/%", "/usr/sbin/%" ],
-    "tmp": [ "/Users/%/tmp/%%", "/tmp/%" ]
+    "system_binaries": ["/usr/bin/%", "/usr/sbin/%"],
+    "tmp": ["/Users/%/tmp/%%", "/tmp/%"]
   }
 }
 ```
@@ -65,45 +69,57 @@ at runtime, rather than have to update (and version-manage) a YARA rules file on
 organization may also treat YARA rules as security-sensitive data, and you may not wish to store that data on the
 filesystem of every osquery host.
 
-To configure osquery to allow the fetching of YARA rules at runtime, first you must set the `enable_yara_sigurl` flag.
+To configure osquery to allow the fetching of YARA rules at runtime, you have to set up your `yara` configuration file
+with the `signature_urls` section. This will be an array that can be a mix of full URLs pointing to single Yara rule,
+or a partial URLs, where the path part can be a regex which will be used to match multiple URLs and rules.
+Each entry exists to later allow single or multiple URLs, provided via the `sigurl` constraint in the query.
 
-Then, set up your `yara` configuration file with the `signature_urls` section, supplying one or more sources for YARA
-rules that will be fetched at runtime:
+Since the path part of a URL string (the part after the domain) is always parsed as regex, we need to escape
+the regex special characters like `.`, if we want to use them to specify a full URL.
+
+Below a configuration example:
 
 ```json
- "yara": { 
-   "signature_urls": { 
-     "sig_url_1": "https://raw.githubusercontent.com/Yara-Rules/rules/master/cve_rules/CVE-2010-0805.yar", 
-     "sig_url_2": "https://raw.githubusercontent.com/Yara-Rules/rules/master/crypto/crypto_signatures.yar", 
-     "sig_url_3": "https://raw.githubusercontent.com/Yara-Rules/rules/master/malware/APT_APT3102.yar"
-   }
- }
+"yara": {
+  "signature_urls": [
+    "https://raw.githubusercontent.com/Yara-Rules/rules/master/cve_rules/CVE-2010-0805\\.yar",
+    "https://raw.githubusercontent.com/Yara-Rules/rules/master/crypto/crypto_signatures\\.yar",
+    "https://raw.githubusercontent.com/Yara-Rules/rules/master/malware/APT_APT3102\\.yar",
+    "https://raw.githubusercontent.com/Yara-Rules/rules/devel/CVE_Rules/CVE-.*"
+  ]
+}
 ```
 
-These references, here named `sig_url_1`, `sig_url_2`, etc. are then supplied with your `yara` table query to specify
-the `sigurl` column. For example:
+and a couple of queries examples:
 
-```sql
-osquery> select * from yara where path like '%' and sigurl='sig_url_2';
-+-------------------------+--------------+-------+-----------+---------+---------+---------+------+-----------+
-| path                    | matches      | count | sig_group | sigfile | sigrule | strings | tags | sigurl    |
-+-------------------------+--------------+-------+-----------+---------+---------+---------+------+-----------+
-| CMakeCache.txt          | Big_Numbers1 | 1     |           |         |         |         |      | sig_url_2 |
-+-------------------------+--------------+-------+-----------+---------+---------+---------+------+-----------+
+```sh
+# This is valid
+SELECT * FROM yara WHERE path="/usr/bin/ls" AND sigurl='https://raw.githubusercontent.com/Yara-Rules/rules/master/cve_rules/CVE-2010-0805.yar';
+
+# This too
+SELECT * FROM yara WHERE path="/usr/bin/ls" AND sigurl='https://raw.githubusercontent.com/Yara-Rules/rules/devel/CVE_Rules/CVE-2010-0805.yar';
+
+# This is not allowed
+SELECT * FROM yara WHERE path="/usr/bin/ls" AND sigurl='https://raw.githubusercontent.com/Yara-Rules/rules/devel/malware/APT_APT3102.yar';
+
+YARA signature url https://raw.githubusercontent.com/Yara-Rules/rules/devel/malware/APT_APT3102.yar not allowed
+Failed to get YARA rule url: https://raw.githubusercontent.com/Yara-Rules/rules/devel/malware/APT_APT3102.yar
+Query must specify sig_group, sigfile, or sigrule for scan
 ```
 
 YARA rule strings are omitted from output by default, to prevent disclosure in osquery's results and logs. To include
 the YARA rules in the `sigrule` column, set the `enable_yara_string` flag to `true`.
 
-By nature of the design described above, your source URL for YARA rules (`sigurl`) can only be one of the URLs in the
-osquery config (in the `signature_urls` section). This is your explicit list of allowed source domains for YARA rules.
+#### Authentication
+
+Request authentication can be enabled with the `--yara_sigurl_authenticate` flag. When enabled, instead of a `GET` request osquery will send a `POST` request with a JSON body containing the node key. The receiving server can then authenticate the request using the node key before responding with the yara rules. All other behavior remains unchanged.
 
 #### Notes
 
 - Retrieved YARA rules are retrieved only once and then cached; the cached copy is used until it is stale as specified
- by the HTTP `Last-Modified` header in the server's response.
+  by the HTTP `Last-Modified` header in the server's response.
 - The osquery agent always validates the HTTPS server certificate of the server providing the YARA signatures, but
-currently has no support for client authentication. YARA rule files must be accessible without authentication.
+  currently has no support for client authentication. YARA rule files must be accessible without authentication.
 
 ## Continuous monitoring using the yara_events table
 
@@ -159,7 +175,7 @@ you must use `LIKE` if you want to use a wildcard pattern.
 
 Once the `where` is out of the way, you must specify the "what" part. This is done through either the
 `sigfile` or `sig_group` constraints. The `sigfile` constraint must be an absolute path to a signature
-file on the filesystem, not a elative path. The signature file will be compiled only for the execution
+file on the filesystem, not a relative path. The signature file will be compiled only for the execution
 of this one query and removed afterwards. The `sig_group` constraint must consist of a named signature
 grouping from your configuration file.
 
@@ -244,7 +260,7 @@ osquery> select * from yara where path LIKE 'C:\tmp\%' and sigrule = 'rule hello
 +------------------------------+-------------+-------+-----------+---------+---------+------+
 ```
 
-**Note:**  when entering a `sigrule` inline, be careful to avoid double-quoting the rule and then also a string
+**Note:** when entering a `sigrule` inline, be careful to avoid double-quoting the rule and then also a string
 variable within the rule, as the second `"` will terminate the rule and cause a `syntax error`. In the example
 above, the `sigrule` string has been single-quoted so the enclosed variable `"Hello world"` can be double-quoted.
 

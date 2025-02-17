@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include <osquery/core/core.h>
+#include <osquery/core/flagalias.h>
 #include <osquery/core/flags.h>
 #include <osquery/core/system.h>
 #include <osquery/logger/logger.h>
@@ -27,14 +28,21 @@ FLAG(bool, enable_foreign, false, "Enable no-op foreign virtual tables");
 FLAG(uint64,
      table_delay,
      0,
-     "Add an optional microsecond delay between table scans");
+     "Add an optional millisecond delay between table scans");
 
 FLAG(bool,
      extensions_default_index,
      true,
      "Enable INDEX on all extension table columns (default true)");
 
-FLAG(bool, table_exceptions, false, "Allow tables to throw exceptions");
+/* NOTE: the default is false, because it's easier to enable it in one place
+   when starting osquery, instead of having each test enable them,
+   so that they are seen and fixed. */
+FLAG(bool,
+     ignore_table_exceptions,
+     false,
+     "Ignore exceptions thrown by tables. osquery and extensions default to "
+     "true.");
 
 SHELL_FLAG(bool, planner, false, "Enable osquery runtime planner output");
 
@@ -708,6 +716,8 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
   auto* pVtab = (VirtualTable*)tab;
   const auto& columns = pVtab->content->columns;
 
+  pVtab->instance->addAffectedTable(pVtab->content);
+
   ConstraintSet constraints;
   // Keep track of the index used for each valid constraint.
   // Expect this index to correspond with argv within xFilter.
@@ -746,7 +756,8 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
       }
       const auto& name = std::get<0>(columns[constraint_info.iColumn]);
       const auto& type = std::get<1>(columns[constraint_info.iColumn]);
-      if (!sensibleComparison(type, constraint_info.op)) {
+      auto constraint_op = constraint_info.op;
+      if (!sensibleComparison(type, constraint_op)) {
         cost += 10;
         continue;
       }
@@ -763,19 +774,24 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
         continue;
       }
 
+      // Set optimized constraints to process IN(n) all-at-once.
+      // We manually overwrite the constraint op until xFilter can validate
+      // if this constraint was supposed to process IN all-at-once or not.
+      if (sqlite3_vtab_in(pIdxInfo, i, -1) &&
+          (options & ColumnOptions::OPTIMIZED)) {
+        sqlite3_vtab_in(pIdxInfo, i, 1);
+        constraint_op = IN_OP;
+      }
+
       // Save a pair of the name and the constraint operator.
       // Use this constraint during xFilter by performing a scan and column
       // name lookup through out all cursor constraint lists.
-      constraints.push_back(
-          std::make_pair(name, Constraint(constraint_info.op)));
+      constraints.push_back(std::make_pair(name, Constraint(constraint_op)));
 
-      // important: if we specify an index, it means xFilter will be called
-      // once for every row.  So if you have an IN() list with 50 items,
-      // xFilter will get called 50 times, once for each item.  If you have
-      // a JOIN with 500 rows, xFilter is called 500 times.  Therefore,
-      // when a spec file specifies a column to be required or index, the
-      // table implementation must be able to quickly find and return a
-      // single row. See issue 5379.
+      // If we specify an index for a JOIN, it means xFilter is called 500
+      // times. Therefore, when a spec file specifies a column to be required or
+      // index, the table implementation must be able to quickly find and return
+      // a single row. See issue 5379.
 
       pIdxInfo->aConstraintUsage[i].argvIndex = static_cast<int>(++expr_index);
 
@@ -783,7 +799,7 @@ static int xBestIndex(sqlite3_vtab* tab, sqlite3_index_info* pIdxInfo) {
         plan("xBestIndex Adding index constraint for table: " +
              pVtab->content->name + " [column=" + name +
              " arg_index=" + std::to_string(expr_index) +
-             " op=" + std::to_string(constraint_info.op) + "]");
+             " op=" + std::to_string(constraint_op) + "]");
       }
     }
   }
@@ -893,8 +909,8 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
     }
   }
 
-// Filtering between cursors happens iteratively, not consecutively.
-// If there are multiple sets of constraints, they apply to each cursor.
+  // Filtering between cursors happens iteratively, not consecutively.
+  // If there are multiple sets of constraints, they apply to each cursor.
   if (FLAGS_planner) {
     plan("xFilter Filtering called for table: " + content->name +
          " [constraint_count=" + std::to_string(content->constraints.size()) +
@@ -907,21 +923,49 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
     auto& constraints = content->constraints[idxNum];
     if (argc > 0) {
       for (size_t i = 0; i < static_cast<size_t>(argc); ++i) {
-        auto expr = (const char*)sqlite3_value_text(argv[i]);
-        if (expr == nullptr || expr[0] == 0) {
-          // SQLite did not expose the expression value.
-          continue;
-        }
         // Set the expression from SQLite's now-populated argv.
         auto& constraint = constraints[i];
-        constraint.second.expr = std::string(expr);
-        if (FLAGS_planner) {
-          plan("xFilter Adding constraint to cursor (" +
-               std::to_string(pCur->id) + "): " + constraint.first + " " +
-               opString(constraint.second.op) + " " + constraint.second.expr);
+        auto constraint_lambda = [&pCur, &context, &constraint](auto value,
+                                                                bool safe) {
+          auto expr = (const char*)sqlite3_value_text(value);
+          if (expr == nullptr || (!safe && expr[0] == 0)) {
+            // The column is unsafe to handle unexposed expressions values.
+            return;
+          }
+
+          constraint.second.expr = std::string(expr);
+
+          if (FLAGS_planner) {
+            plan("xFilter Adding constraint to cursor (" +
+                 std::to_string(pCur->id) + "): " + constraint.first + " " +
+                 opString(constraint.second.op) + " " + constraint.second.expr);
+          }
+          // Add the constraint to the column-sorted query request map.
+          context.constraints[constraint.first].add(constraint.second);
+        };
+
+        // If the constraint op is set to `IN`, then we know this was manually
+        // overwritten to validate when to process an IN constraint all-at-once.
+        // We switch the constraint op back to `EQUALS` for sqlite to understand
+        // it.
+        if (constraint.second.op == IN_OP) {
+          constraint.second.op = EQUALS;
+          auto rc = SQLITE_EMPTY;
+          sqlite3_value* in_value = nullptr;
+
+          for (rc = sqlite3_vtab_in_first(argv[i], &in_value);
+               rc == SQLITE_OK && in_value;
+               rc = sqlite3_vtab_in_next(argv[i], &in_value)) {
+            constraint_lambda(in_value, true);
+          }
+
+          if (rc != SQLITE_DONE && rc != SQLITE_EMPTY) {
+            LOG(ERROR) << "Error processing an IN constraint: "
+                       << constraint.first << " (" << rc << ")";
+          }
+        } else {
+          constraint_lambda(argv[i], false);
         }
-        // Add the constraint to the column-sorted query request map.
-        context.constraints[constraint.first].add(constraint.second);
       }
     } else if (constraints.size() > 0) {
       // Constraints failed.
@@ -962,9 +1006,11 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
                  << " table returns data based on the current user by default, "
                     "consider JOINing against the users table";
   } else if (!required_satisfied) {
-    LOG(WARNING)
-        << "Table " << pVtab->content->name
+    std::ostringstream out;
+    out << "Table " << pVtab->content->name
         << " was queried without a required column in the WHERE clause";
+    LOG(WARNING) << out.str();
+    setTableErrorMessage(&pVtab->base, out.str());
   } else if (!events_satisfied) {
     LOG(WARNING) << "Table " << pVtab->content->name
                  << " is event-based but events are disabled";
@@ -1006,7 +1052,7 @@ static int xFilter(sqlite3_vtab_cursor* pVtabCursor,
       LOG(ERROR) << "Exception while executing table " << pVtab->content->name
                  << ": " << e.what();
       setTableErrorMessage(pVtabCursor->pVtab, e.what());
-      if (FLAGS_table_exceptions) {
+      if (!FLAGS_ignore_table_exceptions) {
         throw;
       }
       return SQLITE_ERROR;
@@ -1074,7 +1120,6 @@ struct sqlite3_module* getVirtualTableModule(const std::string& table_name,
 } // namespace tables
 
 Status attachTableInternal(const std::string& name,
-                           const std::string& statement,
                            const SQLiteDBInstanceRef& instance,
                            bool is_extension) {
   if (SQLiteDBManager::isDisabled(name)) {
@@ -1098,12 +1143,14 @@ Status attachTableInternal(const std::string& name,
       instance->db(), name.c_str(), module, (void*)&(*instance));
 
   if (rc == SQLITE_OK || rc == SQLITE_MISUSE) {
-    auto format =
-        "CREATE VIRTUAL TABLE temp." + name + " USING " + name + statement;
+    auto format = "CREATE VIRTUAL TABLE temp." + name + " USING " + name;
 
     rc =
         sqlite3_exec(instance->db(), format.c_str(), nullptr, nullptr, nullptr);
-
+    if (rc != SQLITE_OK) {
+      LOG(ERROR) << "Error creating named virtual table: " << name << " (" << rc
+                 << ")";
+    }
   } else {
     LOG(ERROR) << "Error attaching table: " << name << " (" << rc << ")";
   }
@@ -1155,12 +1202,28 @@ void attachVirtualTables(const SQLiteDBInstanceRef& instance) {
   bool is_extension = false;
 
   for (const auto& name : RegistryFactory::get().names("table")) {
-    // Column information is nice for virtual table create call.
     auto status =
         Registry::call("table", name, {{"action", "columns"}}, response);
-    if (status.ok()) {
-      auto statement = columnDefinition(response, true, is_extension);
-      attachTableInternal(name, statement, instance, is_extension);
+    if (!status.ok()) {
+      continue;
+    }
+    // skip tables in a "pending" state as these will be attached separately
+    // using SQL plugin "attach" request.
+    bool isPending = false;
+    for (const auto& item : response) {
+      if (item.at("id") == "attributes") {
+        auto itemAttributes =
+            static_cast<TableAttributes>(std::stoi(item.at("attributes")));
+        if ((itemAttributes & TableAttributes::PENDING) > 0) {
+          isPending = true;
+          break;
+        }
+      }
+    }
+    if (!isPending) {
+      attachTableInternal(name, instance, is_extension);
+    } else {
+      VLOG(1) << "Not attaching pending table: " << name;
     }
   }
 }

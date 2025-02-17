@@ -38,6 +38,11 @@ namespace errc = boost::system::errc;
 
 namespace osquery {
 
+namespace {
+const std::wstring kTrustedInstallerSID{
+    L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"};
+}
+
 /*
  * Avoid having the same right being used in multiple CHMOD_* macros. Doing so
  * will cause issues when requesting certain permissions in the presence of deny
@@ -906,10 +911,15 @@ static Status lowPrivWriteDenied(PACL acl) {
   std::vector<char> system_buffer(sid_buff_size, '\0');
   std::vector<char> administrators_buffer(sid_buff_size, '\0');
   std::vector<char> world_buffer(sid_buff_size, '\0');
+  std::vector<char> trusted_installer_buffer(sid_buff_size, '\0');
+  std::vector<char> creator_owner_buffer(sid_buff_size, '\0');
 
   auto system_sid = static_cast<PSID>(system_buffer.data());
   auto admins_sid = static_cast<PSID>(administrators_buffer.data());
   auto world_sid = static_cast<PSID>(world_buffer.data());
+  auto trusted_installer_sid =
+      static_cast<PSID>(trusted_installer_buffer.data());
+  auto creator_owner_sid = static_cast<PSID>(creator_owner_buffer.data());
 
   if (!CreateWellKnownSid(
           WinBuiltinAdministratorsSid, nullptr, system_sid, &sid_buff_size)) {
@@ -921,6 +931,14 @@ static Status lowPrivWriteDenied(PACL acl) {
   }
   if (!CreateWellKnownSid(WinWorldSid, nullptr, world_sid, &sid_buff_size)) {
     return Status(-1, "CreateWellKnownSid for Everyone failed");
+  }
+  if (!CreateWellKnownSid(
+          WinCreatorOwnerSid, nullptr, creator_owner_sid, &sid_buff_size)) {
+    return Status(-1, "CreateWellKnownSid for CREATOR OWNER failed");
+  }
+  if (!ConvertStringSidToSid(kTrustedInstallerSID.c_str(),
+                             &trusted_installer_sid)) {
+    return Status::failure("ConvertStringSidToSid for TrustedInstaller failed");
   }
 
   PVOID void_ent = nullptr;
@@ -956,9 +974,13 @@ static Status lowPrivWriteDenied(PACL acl) {
     if (entry->AceType == ACCESS_ALLOWED_ACE_TYPE) {
       auto allowed_ace = reinterpret_cast<PACCESS_ALLOWED_ACE>(entry);
 
-      // Administrators and SYSTEM are allowed Full access
+      /* Administrators, TrustedInstaller and SYSTEM are allowed Full access.
+         CREATOR OWNER doesn't give permissions to the object,
+         so we ignore it too. */
       if (EqualSid(&allowed_ace->SidStart, system_sid) ||
-          EqualSid(&allowed_ace->SidStart, admins_sid)) {
+          EqualSid(&allowed_ace->SidStart, admins_sid) ||
+          EqualSid(&allowed_ace->SidStart, trusted_installer_sid) ||
+          EqualSid(&allowed_ace->SidStart, creator_owner_sid)) {
         continue;
       }
 
@@ -1054,15 +1076,6 @@ bool PlatformFile::getFileTimes(PlatformTime& times) {
           FALSE);
 }
 
-bool PlatformFile::setFileTimes(const PlatformTime& times) {
-  if (!isValid()) {
-    return false;
-  }
-
-  return (::SetFileTime(handle_, nullptr, &times.times[0], &times.times[1]) !=
-          FALSE);
-}
-
 ssize_t PlatformFile::getOverlappedResultForRead(void* buf,
                                                  size_t requested_size) {
   ssize_t nret = 0;
@@ -1092,6 +1105,16 @@ ssize_t PlatformFile::getOverlappedResultForRead(void* buf,
       has_pending_io_ = true;
       last_read_.is_active_ = true;
       nret = -1;
+    } else if (last_error == ERROR_HANDLE_EOF) {
+      // We arrived at the end of the file. This normally happens only with
+      // empty files, or when over reading. In the other case where the last
+      // read gets all the final bytes, GetOverlappedResult will succeed and
+      // report no further pending data.
+
+      has_pending_io_ = false;
+      last_read_.is_active_ = false;
+      last_read_.buffer_.reset(nullptr);
+      nret = 0;
     } else {
       // Error has occurred, just in case, cancel all IO
       ::CancelIo(handle_);
@@ -1311,7 +1334,7 @@ bool platformSetSafeDbPerms(const std::string& path) {
     return false;
   }
 
-  std::wstring wide_path = stringToWstring(path.c_str());
+  std::wstring wide_path = stringToWstring(path);
   // Apply 'safe' DACL and avoid returning to attempt applying the DACL
   ret = SetNamedSecurityInfoW(
       const_cast<PWSTR>(wide_path.c_str()),
